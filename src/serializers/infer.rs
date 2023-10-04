@@ -4,13 +4,12 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyByteArray, PyBytes, PyDate, PyDateTime, PyDelta, PyDict, PyFrozenSet, PyIterator, PyList, PySet, PyString,
-    PyTime, PyTuple,
+    PyByteArray, PyBytes, PyDate, PyDateTime, PyDict, PyFrozenSet, PyIterator, PyList, PySet, PyString, PyTime, PyTuple,
 };
 
 use serde::ser::{Error, Serialize, SerializeMap, SerializeSeq, Serializer};
 
-use crate::input::Int;
+use crate::input::{EitherTimedelta, Int};
 use crate::serializers::errors::SERIALIZATION_ERR_MARKER;
 use crate::serializers::filter::SchemaFilter;
 use crate::serializers::shared::{PydanticSerializer, TypeSerializer};
@@ -30,7 +29,7 @@ pub(crate) fn infer_to_python(
     exclude: Option<&PyAny>,
     extra: &Extra,
 ) -> PyResult<PyObject> {
-    infer_to_python_known(&extra.ob_type_lookup.get_type(value), value, include, exclude, extra)
+    infer_to_python_known(extra.ob_type_lookup.get_type(value), value, include, exclude, extra)
 }
 
 // arbitrary ids to identify that we recursed through infer_to_{python,json}_known
@@ -38,7 +37,7 @@ pub(crate) fn infer_to_python(
 const INFER_DEF_REF_ID: usize = usize::MAX;
 
 pub(crate) fn infer_to_python_known(
-    ob_type: &ObType,
+    ob_type: ObType,
     value: &PyAny,
     include: Option<&PyAny>,
     exclude: Option<&PyAny>,
@@ -134,8 +133,8 @@ pub(crate) fn infer_to_python_known(
                 .map(|s| s.into_py(py))?,
             ObType::Bytearray => {
                 let py_byte_array: &PyByteArray = value.downcast()?;
-                // see https://docs.rs/pyo3/latest/pyo3/types/struct.PyByteArray.html#method.as_bytes
-                // for why this is marked unsafe
+                // Safety: the GIL is held while bytes_to_string is running; it doesn't run
+                // arbitrary Python code, so py_byte_array cannot be mutated.
                 let bytes = unsafe { py_byte_array.as_bytes() };
                 extra
                     .config
@@ -176,8 +175,11 @@ pub(crate) fn infer_to_python_known(
                 iso_time.into_py(py)
             }
             ObType::Timedelta => {
-                let py_timedelta: &PyDelta = value.downcast()?;
-                extra.config.timedelta_mode.timedelta_to_json(py_timedelta)?
+                let either_delta = EitherTimedelta::try_from(value)?;
+                extra
+                    .config
+                    .timedelta_mode
+                    .either_delta_to_json(value.py(), &either_delta)?
             }
             ObType::Url => {
                 let py_url: PyUrl = value.extract()?;
@@ -313,7 +315,7 @@ impl<'py> SerializeInfer<'py> {
 impl<'py> Serialize for SerializeInfer<'py> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let ob_type = self.extra.ob_type_lookup.get_type(self.value);
-        infer_serialize_known(&ob_type, self.value, serializer, self.include, self.exclude, self.extra)
+        infer_serialize_known(ob_type, self.value, serializer, self.include, self.exclude, self.extra)
     }
 }
 
@@ -325,7 +327,7 @@ pub(crate) fn infer_serialize<S: Serializer>(
     extra: &Extra,
 ) -> Result<S::Ok, S::Error> {
     infer_serialize_known(
-        &extra.ob_type_lookup.get_type(value),
+        extra.ob_type_lookup.get_type(value),
         value,
         serializer,
         include,
@@ -335,7 +337,7 @@ pub(crate) fn infer_serialize<S: Serializer>(
 }
 
 pub(crate) fn infer_serialize_known<S: Serializer>(
-    ob_type: &ObType,
+    ob_type: ObType,
     value: &PyAny,
     serializer: S,
     include: Option<&PyAny>,
@@ -426,8 +428,12 @@ pub(crate) fn infer_serialize_known<S: Serializer>(
         }
         ObType::Bytearray => {
             let py_byte_array: &PyByteArray = value.downcast().map_err(py_err_se_err)?;
-            let bytes = unsafe { py_byte_array.as_bytes() };
-            extra.config.bytes_mode.serialize_bytes(bytes, serializer)
+            // Safety: the GIL is held while serialize_bytes is running; it doesn't run
+            // arbitrary Python code, so py_byte_array cannot be mutated.
+            extra
+                .config
+                .bytes_mode
+                .serialize_bytes(unsafe { py_byte_array.as_bytes() }, serializer)
         }
         ObType::Dict => serialize_dict!(value.downcast::<PyDict>().map_err(py_err_se_err)?),
         ObType::List => serialize_seq_filter!(PyList),
@@ -450,11 +456,11 @@ pub(crate) fn infer_serialize_known<S: Serializer>(
             serializer.serialize_str(&iso_time)
         }
         ObType::Timedelta => {
-            let py_timedelta: &PyDelta = value.downcast().map_err(py_err_se_err)?;
+            let either_delta = EitherTimedelta::try_from(value).map_err(py_err_se_err)?;
             extra
                 .config
                 .timedelta_mode
-                .timedelta_serialize(py_timedelta, serializer)
+                .timedelta_serialize(value.py(), &either_delta, serializer)
         }
         ObType::Url => {
             let py_url: PyUrl = value.extract().map_err(py_err_se_err)?;
@@ -529,7 +535,7 @@ pub(crate) fn infer_serialize_known<S: Serializer>(
                 let msg = format!(
                     "{}Unable to serialize unknown type: {}",
                     SERIALIZATION_ERR_MARKER,
-                    safe_repr(value)
+                    safe_repr(value.get_type()),
                 );
                 return Err(S::Error::custom(msg));
             }
@@ -540,7 +546,10 @@ pub(crate) fn infer_serialize_known<S: Serializer>(
 }
 
 fn unknown_type_error(value: &PyAny) -> PyErr {
-    PydanticSerializationError::new_err(format!("Unable to serialize unknown type: {}", safe_repr(value)))
+    PydanticSerializationError::new_err(format!(
+        "Unable to serialize unknown type: {}",
+        safe_repr(value.get_type())
+    ))
 }
 
 fn serialize_unknown(value: &PyAny) -> Cow<str> {
@@ -555,10 +564,10 @@ fn serialize_unknown(value: &PyAny) -> Cow<str> {
 
 pub(crate) fn infer_json_key<'py>(key: &'py PyAny, extra: &Extra) -> PyResult<Cow<'py, str>> {
     let ob_type = extra.ob_type_lookup.get_type(key);
-    infer_json_key_known(&ob_type, key, extra)
+    infer_json_key_known(ob_type, key, extra)
 }
 
-pub(crate) fn infer_json_key_known<'py>(ob_type: &ObType, key: &'py PyAny, extra: &Extra) -> PyResult<Cow<'py, str>> {
+pub(crate) fn infer_json_key_known<'py>(ob_type: ObType, key: &'py PyAny, extra: &Extra) -> PyResult<Cow<'py, str>> {
     match ob_type {
         ObType::None => super::type_serializers::simple::none_json_key(),
         ObType::Int | ObType::IntSubclass | ObType::Float | ObType::FloatSubclass => {
@@ -576,8 +585,15 @@ pub(crate) fn infer_json_key_known<'py>(ob_type: &ObType, key: &'py PyAny, extra
             .bytes_to_string(key.py(), key.downcast::<PyBytes>()?.as_bytes()),
         ObType::Bytearray => {
             let py_byte_array: &PyByteArray = key.downcast()?;
-            let bytes = unsafe { py_byte_array.as_bytes() };
-            extra.config.bytes_mode.bytes_to_string(key.py(), bytes)
+            // Safety: the GIL is held while serialize_bytes is running; it doesn't run
+            // arbitrary Python code, so py_byte_array cannot be mutated during the call.
+            //
+            // We copy the bytes into a new buffer immediately afterwards
+            extra
+                .config
+                .bytes_mode
+                .bytes_to_string(key.py(), unsafe { py_byte_array.as_bytes() })
+                .map(|cow| Cow::Owned(cow.into_owned()))
         }
         ObType::Datetime => {
             let py_dt: &PyDateTime = key.downcast()?;
@@ -600,8 +616,8 @@ pub(crate) fn infer_json_key_known<'py>(ob_type: &ObType, key: &'py PyAny, extra
             Ok(Cow::Owned(uuid))
         }
         ObType::Timedelta => {
-            let py_timedelta: &PyDelta = key.downcast()?;
-            extra.config.timedelta_mode.json_key(py_timedelta)
+            let either_delta = EitherTimedelta::try_from(key)?;
+            extra.config.timedelta_mode.json_key(key.py(), &either_delta)
         }
         ObType::Url => {
             let py_url: PyUrl = key.extract()?;
@@ -613,7 +629,7 @@ pub(crate) fn infer_json_key_known<'py>(ob_type: &ObType, key: &'py PyAny, extra
         }
         ObType::Tuple => {
             let mut key_build = super::type_serializers::tuple::KeyBuilder::new();
-            for element in key.downcast::<PyTuple>()?.iter() {
+            for element in key.downcast::<PyTuple>()? {
                 key_build.push(&infer_json_key(element, extra)?);
             }
             Ok(Cow::Owned(key_build.finish()))

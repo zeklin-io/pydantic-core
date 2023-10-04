@@ -4,9 +4,7 @@ use pyo3::types::PyDict;
 use crate::errors::ValResult;
 use crate::input::Input;
 
-use crate::recursion_guard::RecursionGuard;
-
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::{validation_state::ValidationState, BuildValidator, CombinedValidator, DefinitionsBuilder, Validator};
 
 /// This might seem useless, but it's useful in DictValidator to avoid Option<Validator> a lot
 #[derive(Debug, Clone)]
@@ -27,23 +25,16 @@ impl BuildValidator for AnyValidator {
 impl_py_gc_traverse!(AnyValidator {});
 
 impl Validator for AnyValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        _extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        _state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        // Ok(input.clone().into_py(py))
         Ok(input.to_object(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        _ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, _ultra_strict: bool) -> bool {
         false
     }
 
@@ -51,7 +42,7 @@ impl Validator for AnyValidator {
         Self::EXPECTED_TYPE
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }

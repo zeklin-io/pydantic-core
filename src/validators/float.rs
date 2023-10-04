@@ -3,12 +3,11 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::build_tools::{is_strict, schema_or_config_same};
-use crate::errors::{ErrorType, ValError, ValResult};
+use crate::errors::{ErrorType, ErrorTypeDefaults, ValError, ValResult};
 use crate::input::Input;
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
 pub struct FloatBuilder;
 
@@ -63,27 +62,21 @@ impl BuildValidator for FloatValidator {
 impl_py_gc_traverse!(FloatValidator {});
 
 impl Validator for FloatValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        let either_float = input.validate_float(extra.strict.unwrap_or(self.strict), extra.ultra_strict)?;
-        let float: f64 = either_float.try_into()?;
-        if !self.allow_inf_nan && !float.is_finite() {
-            return Err(ValError::new(ErrorType::FiniteNumber, input));
+        let strict = state.strict_or(self.strict);
+        let either_float = input.validate_float(strict, state.extra().ultra_strict)?;
+        if !self.allow_inf_nan && !either_float.as_f64().is_finite() {
+            return Err(ValError::new(ErrorTypeDefaults::FiniteNumber, input));
         }
-        Ok(float.into_py(py))
+        Ok(either_float.into_py(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        _ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, _ultra_strict: bool) -> bool {
         true
     }
 
@@ -91,7 +84,7 @@ impl Validator for FloatValidator {
         Self::EXPECTED_TYPE
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }
@@ -110,18 +103,17 @@ pub struct ConstrainedFloatValidator {
 impl_py_gc_traverse!(ConstrainedFloatValidator {});
 
 impl Validator for ConstrainedFloatValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        let either_float = input.validate_float(extra.strict.unwrap_or(self.strict), extra.ultra_strict)?;
-        let float: f64 = either_float.try_into()?;
+        let strict = state.strict_or(self.strict);
+        let either_float = input.validate_float(strict, state.extra().ultra_strict)?;
+        let float: f64 = either_float.as_f64();
         if !self.allow_inf_nan && !float.is_finite() {
-            return Err(ValError::new(ErrorType::FiniteNumber, input));
+            return Err(ValError::new(ErrorTypeDefaults::FiniteNumber, input));
         }
         if let Some(multiple_of) = self.multiple_of {
             let rem = float % multiple_of;
@@ -130,6 +122,7 @@ impl Validator for ConstrainedFloatValidator {
                 return Err(ValError::new(
                     ErrorType::MultipleOf {
                         multiple_of: multiple_of.into(),
+                        context: None,
                     },
                     input,
                 ));
@@ -137,32 +130,52 @@ impl Validator for ConstrainedFloatValidator {
         }
         if let Some(le) = self.le {
             if float > le {
-                return Err(ValError::new(ErrorType::LessThanEqual { le: le.into() }, input));
+                return Err(ValError::new(
+                    ErrorType::LessThanEqual {
+                        le: le.into(),
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
         if let Some(lt) = self.lt {
             if float >= lt {
-                return Err(ValError::new(ErrorType::LessThan { lt: lt.into() }, input));
+                return Err(ValError::new(
+                    ErrorType::LessThan {
+                        lt: lt.into(),
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
         if let Some(ge) = self.ge {
             if float < ge {
-                return Err(ValError::new(ErrorType::GreaterThanEqual { ge: ge.into() }, input));
+                return Err(ValError::new(
+                    ErrorType::GreaterThanEqual {
+                        ge: ge.into(),
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
         if let Some(gt) = self.gt {
             if float <= gt {
-                return Err(ValError::new(ErrorType::GreaterThan { gt: gt.into() }, input));
+                return Err(ValError::new(
+                    ErrorType::GreaterThan {
+                        gt: gt.into(),
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
-        Ok(float.into_py(py))
+        Ok(either_float.into_py(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        _ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, _ultra_strict: bool) -> bool {
         true
     }
 
@@ -170,7 +183,7 @@ impl Validator for ConstrainedFloatValidator {
         "constrained-float"
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }

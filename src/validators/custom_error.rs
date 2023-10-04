@@ -5,10 +5,10 @@ use pyo3::types::PyDict;
 use crate::build_tools::py_schema_err;
 use crate::errors::{ErrorType, PydanticCustomError, PydanticKnownError, ValError, ValResult};
 use crate::input::Input;
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
-use super::{build_validator, BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::validation_state::ValidationState;
+use super::{build_validator, BuildValidator, CombinedValidator, DefinitionsBuilder, Validator};
 
 #[derive(Debug, Clone)]
 pub enum CustomError {
@@ -57,7 +57,7 @@ impl CustomError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CustomErrorValidator {
     validator: Box<CombinedValidator>,
     custom_error: CustomError,
@@ -88,32 +88,26 @@ impl BuildValidator for CustomErrorValidator {
 impl_py_gc_traverse!(CustomErrorValidator { validator });
 
 impl Validator for CustomErrorValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        definitions: &'data Definitions<CombinedValidator>,
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
         self.validator
-            .validate(py, input, extra, definitions, recursion_guard)
+            .validate(py, input, state)
             .map_err(|_| self.custom_error.as_val_error(input))
     }
 
-    fn different_strict_behavior(
-        &self,
-        definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
-        self.validator.different_strict_behavior(definitions, ultra_strict)
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
+        self.validator.different_strict_behavior(ultra_strict)
     }
 
     fn get_name(&self) -> &str {
         &self.name
     }
 
-    fn complete(&mut self, definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
-        self.validator.complete(definitions)
+    fn complete(&self) -> PyResult<()> {
+        self.validator.complete()
     }
 }

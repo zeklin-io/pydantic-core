@@ -10,8 +10,8 @@ use pyo3::{intern, PyTraverseError, PyVisit};
 
 use crate::build_tools::{py_schema_err, py_schema_error_type, SchemaError};
 use crate::definitions::{Definitions, DefinitionsBuilder};
-use crate::errors::{ErrorMode, LocItem, ValError, ValResult, ValidationError};
-use crate::input::{Input, InputType};
+use crate::errors::{LocItem, ValError, ValResult, ValidationError};
+use crate::input::{Input, InputType, StringMapping};
 use crate::py_gc::PyGcTraverse;
 use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
@@ -27,6 +27,7 @@ mod custom_error;
 mod dataclass;
 mod date;
 mod datetime;
+pub(crate) mod decimal;
 mod definitions;
 mod dict;
 mod float;
@@ -54,11 +55,12 @@ mod typed_dict;
 mod union;
 mod url;
 mod uuid;
+mod validation_state;
 mod with_default;
 
 pub use with_default::DefaultType;
 
-use self::definitions::DefinitionRefValidator;
+pub use self::validation_state::ValidationState;
 
 #[pyclass(module = "pydantic_core._pydantic_core", name = "Some")]
 pub struct PySome {
@@ -96,30 +98,28 @@ impl PySome {
 }
 
 #[pyclass(module = "pydantic_core._pydantic_core")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SchemaValidator {
     validator: CombinedValidator,
-    definitions: Vec<CombinedValidator>,
+    definitions: Definitions<CombinedValidator>,
     schema: PyObject,
     #[pyo3(get)]
     title: PyObject,
     hide_input_in_errors: bool,
+    validation_error_cause: bool,
 }
 
 #[pymethods]
 impl SchemaValidator {
     #[new]
     pub fn py_new(py: Python, schema: &PyAny, config: Option<&PyDict>) -> PyResult<Self> {
-        let self_validator = SelfValidator::new(py)?;
-        let schema = self_validator.validate_schema(py, schema)?;
-
         let mut definitions_builder = DefinitionsBuilder::new();
 
-        let mut validator = build_validator(schema, config, &mut definitions_builder)?;
-        validator.complete(&definitions_builder)?;
-        let mut definitions = definitions_builder.clone().finish()?;
-        for val in &mut definitions {
-            val.complete(&definitions_builder)?;
+        let validator = build_validator(schema, config, &mut definitions_builder)?;
+        let definitions = definitions_builder.finish()?;
+        validator.complete()?;
+        for val in definitions.values() {
+            val.get().unwrap().complete()?;
         }
         let config_title = match config {
             Some(c) => c.get_item("title"),
@@ -130,18 +130,21 @@ impl SchemaValidator {
             None => validator.get_name().into_py(py),
         };
         let hide_input_in_errors: bool = config.get_as(intern!(py, "hide_input_in_errors"))?.unwrap_or(false);
+        let validation_error_cause: bool = config.get_as(intern!(py, "validation_error_cause"))?.unwrap_or(false);
         Ok(Self {
             validator,
             definitions,
             schema: schema.into_py(py),
             title,
             hide_input_in_errors,
+            validation_error_cause,
         })
     }
 
-    pub fn __reduce__(&self, py: Python) -> PyResult<PyObject> {
-        let args = (self.schema.as_ref(py),);
-        let cls = Py::new(py, self.clone())?.getattr(py, "__class__")?;
+    pub fn __reduce__(slf: &PyCell<Self>) -> PyResult<PyObject> {
+        let py = slf.py();
+        let args = (slf.try_borrow()?.schema.to_object(py),);
+        let cls = slf.getattr("__class__")?;
         Ok((cls, args).into_py(py))
     }
 
@@ -155,7 +158,7 @@ impl SchemaValidator {
         context: Option<&PyAny>,
         self_instance: Option<&PyAny>,
     ) -> PyResult<PyObject> {
-        let r = self._validate(
+        self._validate(
             py,
             input,
             InputType::Python,
@@ -163,8 +166,9 @@ impl SchemaValidator {
             from_attributes,
             context,
             self_instance,
-        );
-        r.map_err(|e| self.prepare_validation_err(py, e, ErrorMode::Python))
+            &mut RecursionGuard::default(),
+        )
+        .map_err(|e| self.prepare_validation_err(py, e, InputType::Python))
     }
 
     #[pyo3(signature = (input, *, strict=None, from_attributes=None, context=None, self_instance=None))]
@@ -185,6 +189,7 @@ impl SchemaValidator {
             from_attributes,
             context,
             self_instance,
+            &mut RecursionGuard::default(),
         ) {
             Ok(_) => Ok(true),
             Err(ValError::InternalErr(err)) => Err(err),
@@ -203,12 +208,39 @@ impl SchemaValidator {
         context: Option<&PyAny>,
         self_instance: Option<&PyAny>,
     ) -> PyResult<PyObject> {
+        let recursion_guard = &mut RecursionGuard::default();
         match input.parse_json() {
-            Ok(input) => {
-                let r = self._validate(py, &input, InputType::Json, strict, None, context, self_instance);
-                r.map_err(|e| self.prepare_validation_err(py, e, ErrorMode::Json))
-            }
-            Err(err) => Err(self.prepare_validation_err(py, err, ErrorMode::Json)),
+            Ok(input) => self
+                ._validate(
+                    py,
+                    &input,
+                    InputType::Json,
+                    strict,
+                    None,
+                    context,
+                    self_instance,
+                    recursion_guard,
+                )
+                .map_err(|e| self.prepare_validation_err(py, e, InputType::Json)),
+            Err(err) => Err(self.prepare_validation_err(py, err, InputType::Json)),
+        }
+    }
+
+    #[pyo3(signature = (input, *, strict=None, context=None))]
+    pub fn validate_strings(
+        &self,
+        py: Python,
+        input: &PyAny,
+        strict: Option<bool>,
+        context: Option<&PyAny>,
+    ) -> PyResult<PyObject> {
+        let t = InputType::String;
+        let string_mapping = StringMapping::new_value(input).map_err(|e| self.prepare_validation_err(py, e, t))?;
+
+        let recursion_guard = &mut RecursionGuard::default();
+        match self._validate(py, &string_mapping, t, strict, None, context, None, recursion_guard) {
+            Ok(r) => Ok(r),
+            Err(e) => Err(self.prepare_validation_err(py, e, t)),
         }
     }
 
@@ -225,7 +257,7 @@ impl SchemaValidator {
         context: Option<&PyAny>,
     ) -> PyResult<PyObject> {
         let extra = Extra {
-            mode: InputType::Python,
+            input_type: InputType::Python,
             data: None,
             strict,
             from_attributes,
@@ -235,15 +267,16 @@ impl SchemaValidator {
         };
 
         let guard = &mut RecursionGuard::default();
+        let mut state = ValidationState::new(extra, guard);
         self.validator
-            .validate_assignment(py, obj, field_name, field_value, &extra, &self.definitions, guard)
-            .map_err(|e| self.prepare_validation_err(py, e, ErrorMode::Python))
+            .validate_assignment(py, obj, field_name, field_value, &mut state)
+            .map_err(|e| self.prepare_validation_err(py, e, InputType::Python))
     }
 
     #[pyo3(signature = (*, strict=None, context=None))]
     pub fn get_default_value(&self, py: Python, strict: Option<bool>, context: Option<&PyAny>) -> PyResult<PyObject> {
         let extra = Extra {
-            mode: InputType::Python,
+            input_type: InputType::Python,
             data: None,
             strict,
             from_attributes: None,
@@ -252,15 +285,14 @@ impl SchemaValidator {
             self_instance: None,
         };
         let recursion_guard = &mut RecursionGuard::default();
-        let r = self
-            .validator
-            .default_value(py, None::<i64>, &extra, &self.definitions, recursion_guard);
+        let mut state = ValidationState::new(extra, recursion_guard);
+        let r = self.validator.default_value(py, None::<i64>, &mut state);
         match r {
             Ok(maybe_default) => match maybe_default {
                 Some(v) => Ok(PySome::new(v).into_py(py)),
                 None => Ok(py.None().into_py(py)),
             },
-            Err(e) => Err(self.prepare_validation_err(py, e, ErrorMode::Python)),
+            Err(e) => Err(self.prepare_validation_err(py, e, InputType::Python)),
         }
     }
 
@@ -276,9 +308,6 @@ impl SchemaValidator {
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         self.validator.py_gc_traverse(&visit)?;
         visit.call(&self.schema)?;
-        for slot in &self.definitions {
-            slot.py_gc_traverse(&visit)?;
-        }
         Ok(())
     }
 }
@@ -289,32 +318,32 @@ impl SchemaValidator {
         &'data self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        mode: InputType,
+        input_type: InputType,
         strict: Option<bool>,
         from_attributes: Option<bool>,
         context: Option<&'data PyAny>,
         self_instance: Option<&PyAny>,
+        recursion_guard: &'data mut RecursionGuard,
     ) -> ValResult<'data, PyObject>
     where
         's: 'data,
     {
-        self.validator.validate(
-            py,
-            input,
-            &Extra::new(strict, from_attributes, context, self_instance, mode),
-            &self.definitions,
-            &mut RecursionGuard::default(),
-        )
+        let mut state = ValidationState::new(
+            Extra::new(strict, from_attributes, context, self_instance, input_type),
+            recursion_guard,
+        );
+        self.validator.validate(py, input, &mut state)
     }
 
-    fn prepare_validation_err(&self, py: Python, error: ValError, error_mode: ErrorMode) -> PyErr {
+    fn prepare_validation_err(&self, py: Python, error: ValError, input_type: InputType) -> PyErr {
         ValidationError::from_val_error(
             py,
             self.title.clone_ref(py),
-            error_mode,
+            input_type,
             error,
             None,
             self.hide_input_in_errors,
+            self.validation_error_cause,
         )
     }
 }
@@ -335,15 +364,13 @@ impl<'py> SelfValidator<'py> {
         Ok(Self { validator })
     }
 
-    pub fn validate_schema(&self, py: Python<'py>, schema: &'py PyAny) -> PyResult<&'py PyAny> {
-        let extra = Extra::new(None, None, None, None, InputType::Python);
-        match self.validator.validator.validate(
-            py,
-            schema,
-            &extra,
-            &self.validator.definitions,
-            &mut RecursionGuard::default(),
-        ) {
+    pub fn validate_schema(&self, py: Python<'py>, schema: &'py PyAny, strict: Option<bool>) -> PyResult<&'py PyAny> {
+        let mut recursion_guard = RecursionGuard::default();
+        let mut state = ValidationState::new(
+            Extra::new(strict, None, None, None, InputType::Python),
+            &mut recursion_guard,
+        );
+        match self.validator.validator.validate(py, schema, &mut state) {
             Ok(schema_obj) => Ok(schema_obj.into_ref(py)),
             Err(e) => Err(SchemaError::from_val_error(py, e)),
         }
@@ -357,14 +384,14 @@ impl<'py> SelfValidator<'py> {
 
         let mut definitions_builder = DefinitionsBuilder::new();
 
-        let mut validator = match build_validator(self_schema, None, &mut definitions_builder) {
+        let validator = match build_validator(self_schema, None, &mut definitions_builder) {
             Ok(v) => v,
             Err(err) => return py_schema_err!("Error building self-schema:\n  {}", err),
         };
-        validator.complete(&definitions_builder)?;
-        let mut definitions = definitions_builder.clone().finish()?;
-        for val in &mut definitions {
-            val.complete(&definitions_builder)?;
+        let definitions = definitions_builder.finish()?;
+        validator.complete()?;
+        for val in definitions.values() {
+            val.get().unwrap().complete()?;
         }
         Ok(SchemaValidator {
             validator,
@@ -372,8 +399,15 @@ impl<'py> SelfValidator<'py> {
             schema: py.None(),
             title: "Self Schema".into_py(py),
             hide_input_in_errors: false,
+            validation_error_cause: false,
         })
     }
+}
+
+#[pyfunction(signature = (schema, *, strict = None))]
+pub fn validate_core_schema<'a>(py: Python<'a>, schema: &'a PyAny, strict: Option<bool>) -> PyResult<&'a PyAny> {
+    let self_validator = SelfValidator::new(py)?;
+    self_validator.validate_schema(py, schema, strict)
 }
 
 pub trait BuildValidator: Sized {
@@ -395,13 +429,6 @@ fn build_specific_validator<'a, T: BuildValidator>(
     config: Option<&'a PyDict>,
     definitions: &mut DefinitionsBuilder<CombinedValidator>,
 ) -> PyResult<CombinedValidator> {
-    let py = schema_dict.py();
-    if let Some(schema_ref) = schema_dict.get_as::<String>(intern!(py, "ref"))? {
-        let inner_val = T::build(schema_dict, config, definitions)?;
-        let validator_id = definitions.add_definition(schema_ref, inner_val)?;
-        return Ok(DefinitionRefValidator::new(validator_id).into());
-    }
-
     T::build(schema_dict, config, definitions)
         .map_err(|err| py_schema_error_type!("Error building \"{}\" validator:\n  {}", val_type, err))
 }
@@ -451,6 +478,8 @@ pub fn build_validator<'a>(
         bool::BoolValidator,
         // floats
         float::FloatBuilder,
+        // decimals
+        decimal::DecimalValidator,
         // tuples
         tuple::TuplePositionalValidator,
         tuple::TupleVariableValidator,
@@ -521,7 +550,7 @@ pub fn build_validator<'a>(
 #[derive(Debug)]
 pub struct Extra<'a> {
     /// Validation mode
-    pub mode: InputType,
+    pub input_type: InputType,
     /// This is used as the `data` kwargs to validator functions
     pub data: Option<&'a PyDict>,
     /// whether we're in strict or lax mode
@@ -542,10 +571,10 @@ impl<'a> Extra<'a> {
         from_attributes: Option<bool>,
         context: Option<&'a PyAny>,
         self_instance: Option<&'a PyAny>,
-        mode: InputType,
+        input_type: InputType,
     ) -> Self {
         Extra {
-            mode,
+            input_type,
             data: None,
             strict,
             ultra_strict: false,
@@ -559,7 +588,7 @@ impl<'a> Extra<'a> {
 impl<'a> Extra<'a> {
     pub fn as_strict(&self, ultra_strict: bool) -> Self {
         Self {
-            mode: self.mode,
+            input_type: self.input_type,
             data: self.data,
             strict: Some(true),
             ultra_strict,
@@ -570,7 +599,7 @@ impl<'a> Extra<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[enum_dispatch(PyGcTraverse)]
 pub enum CombinedValidator {
     // typed dict e.g. heterogeneous dicts or simply a model
@@ -597,6 +626,8 @@ pub enum CombinedValidator {
     // floats
     Float(float::FloatValidator),
     ConstrainedFloat(float::ConstrainedFloatValidator),
+    // decimals
+    Decimal(decimal::DecimalValidator),
     // lists
     List(list::ListValidator),
     // sets - unique lists
@@ -664,40 +695,34 @@ pub enum CombinedValidator {
 /// This trait must be implemented by all validators, it allows various validators to be accessed consistently,
 /// validators defined in `build_validator` also need `EXPECTED_TYPE` as a const, but that can't be part of the trait
 #[enum_dispatch(CombinedValidator)]
-pub trait Validator: Send + Sync + Clone + Debug {
+pub trait Validator: Send + Sync + Debug {
     /// Do the actual validation for this schema/type
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        definitions: &'data Definitions<CombinedValidator>,
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject>;
 
     /// Get a default value, currently only used by `WithDefaultValidator`
-    fn default_value<'s, 'data>(
-        &'s self,
+    fn default_value<'data>(
+        &self,
         _py: Python<'data>,
         _outer_loc: Option<impl Into<LocItem>>,
-        _extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        _state: &mut ValidationState,
     ) -> ValResult<'data, Option<PyObject>> {
         Ok(None)
     }
 
     /// Validate assignment to a field of a model
     #[allow(clippy::too_many_arguments)]
-    fn validate_assignment<'s, 'data: 's>(
-        &'s self,
+    fn validate_assignment<'data>(
+        &self,
         _py: Python<'data>,
         _obj: &'data PyAny,
         _field_name: &'data str,
         _field_value: &'data PyAny,
-        _extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        _state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
         let py_err = PyTypeError::new_err(format!("validate_assignment is not supported for {}", self.get_name()));
         Err(py_err.into())
@@ -705,17 +730,13 @@ pub trait Validator: Send + Sync + Clone + Debug {
 
     /// whether the validator behaves differently in strict mode, and in ultra strict mode
     /// implementations should return true if any of their sub-validators return true
-    fn different_strict_behavior(
-        &self,
-        definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool;
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool;
 
     /// `get_name` generally returns `Self::EXPECTED_TYPE` or some other clear identifier of the validator
     /// this is used in the error location in unions, and in the top level message in `ValidationError`
     fn get_name(&self) -> &str;
 
     /// this method must be implemented for any validator which holds references to other validators,
-    /// it is used by `DefinitionRefValidator` to set its name
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()>;
+    /// it is used by `UnionValidator` to calculate strictness
+    fn complete(&self) -> PyResult<()>;
 }

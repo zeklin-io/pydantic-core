@@ -3,13 +3,12 @@ use pyo3::types::{PyDict, PySet};
 
 use crate::errors::ValResult;
 use crate::input::Input;
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
 use super::list::min_length_check;
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SetValidator {
     strict: bool,
     item_validator: Box<CombinedValidator>,
@@ -58,38 +57,22 @@ impl BuildValidator for SetValidator {
 impl_py_gc_traverse!(SetValidator { item_validator });
 
 impl Validator for SetValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        definitions: &'data Definitions<CombinedValidator>,
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        let collection = input.validate_set(extra.strict.unwrap_or(self.strict))?;
+        let collection = input.validate_set(state.strict_or(self.strict))?;
         let set = PySet::empty(py)?;
-        collection.validate_to_set(
-            py,
-            set,
-            input,
-            self.max_length,
-            "Set",
-            &self.item_validator,
-            extra,
-            definitions,
-            recursion_guard,
-        )?;
+        collection.validate_to_set(py, set, input, self.max_length, "Set", &self.item_validator, state)?;
         min_length_check!(input, "Set", self.min_length, set);
         Ok(set.into_py(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         if ultra_strict {
-            self.item_validator.different_strict_behavior(definitions, true)
+            self.item_validator.different_strict_behavior(true)
         } else {
             true
         }
@@ -99,7 +82,7 @@ impl Validator for SetValidator {
         &self.name
     }
 
-    fn complete(&mut self, definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
-        self.item_validator.complete(definitions)
+    fn complete(&self) -> PyResult<()> {
+        self.item_validator.complete()
     }
 }

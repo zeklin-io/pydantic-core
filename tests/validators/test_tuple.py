@@ -107,13 +107,13 @@ def test_tuple_strict_fails_without_tuple(wrong_coll_type: Type[Any], mode, item
         ),
         (
             {'max_length': 3},
-            [1, 2, 3, 4],
-            Err('Tuple should have at most 3 items after validation, not 4 [type=too_long,'),
+            [1, 2, 3, 4, 5],
+            Err('Tuple should have at most 3 items after validation, not 5 [type=too_long,'),
         ),
         (
             {'max_length': 3},
             infinite_generator(),
-            Err('Tuple should have at most 3 items after validation, not 4 [type=too_long,'),
+            Err('Tuple should have at most 3 items after validation, not more [type=too_long,'),
         ),
     ],
     ids=repr,
@@ -264,7 +264,7 @@ def test_positional_empty(py_and_json: PyAndJson):
 
 
 def test_positional_empty_extra(py_and_json: PyAndJson):
-    v = py_and_json({'type': 'tuple-positional', 'items_schema': [], 'extra_schema': {'type': 'int'}})
+    v = py_and_json({'type': 'tuple-positional', 'items_schema': [], 'extras_schema': {'type': 'int'}})
     assert v.validate_test([]) == ()
     assert v.validate_python(()) == ()
     assert v.validate_test([1]) == (1,)
@@ -408,7 +408,7 @@ def test_tuple_fix_extra(input_value, expected, cache):
         {
             'type': 'tuple-positional',
             'items_schema': [{'type': 'int'}, {'type': 'str'}],
-            'extra_schema': {'type': 'str'},
+            'extras_schema': {'type': 'str'},
         }
     )
 
@@ -422,7 +422,7 @@ def test_tuple_fix_extra(input_value, expected, cache):
 
 def test_tuple_fix_extra_any():
     v = SchemaValidator(
-        {'type': 'tuple-positional', 'items_schema': [{'type': 'str'}], 'extra_schema': {'type': 'any'}}
+        {'type': 'tuple-positional', 'items_schema': [{'type': 'str'}], 'extras_schema': {'type': 'any'}}
     )
     assert v.validate_python([b'1']) == ('1',)
     assert v.validate_python([b'1', 2]) == ('1', 2)

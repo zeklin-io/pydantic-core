@@ -1,15 +1,21 @@
 use pyo3::intern;
 use pyo3::prelude::*;
 
+use pyo3::exceptions::PyValueError;
+use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyDate, PyDateTime, PyDelta, PyDeltaAccess, PyDict, PyTime, PyTzInfo};
 use speedate::MicrosecondsPrecisionOverflowBehavior;
 use speedate::{Date, DateTime, Duration, ParseError, Time, TimeConfig};
 use std::borrow::Cow;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 
 use strum::EnumMessage;
 
 use super::Input;
 use crate::errors::{ErrorType, ValError, ValResult};
+use crate::tools::py_err;
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum EitherDate<'a> {
@@ -76,7 +82,8 @@ impl<'a> From<&'a PyTime> for EitherTime<'a> {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum EitherTimedelta<'a> {
     Raw(Duration),
-    Py(&'a PyDelta),
+    PyExact(&'a PyDelta),
+    PySubclass(&'a PyDelta),
 }
 
 impl<'a> From<Duration> for EitherTimedelta<'a> {
@@ -85,13 +92,38 @@ impl<'a> From<Duration> for EitherTimedelta<'a> {
     }
 }
 
-impl<'a> From<&'a PyDelta> for EitherTimedelta<'a> {
-    fn from(timedelta: &'a PyDelta) -> Self {
-        Self::Py(timedelta)
+impl<'a> EitherTimedelta<'a> {
+    pub fn to_duration(&self) -> PyResult<Duration> {
+        match self {
+            Self::Raw(timedelta) => Ok(timedelta.clone()),
+            Self::PyExact(py_timedelta) => Ok(pytimedelta_exact_as_duration(py_timedelta)),
+            Self::PySubclass(py_timedelta) => pytimedelta_subclass_as_duration(py_timedelta),
+        }
+    }
+
+    pub fn try_into_py(&self, py: Python<'a>) -> PyResult<&'a PyDelta> {
+        match self {
+            Self::PyExact(timedelta) => Ok(*timedelta),
+            Self::PySubclass(timedelta) => Ok(*timedelta),
+            Self::Raw(duration) => duration_as_pytimedelta(py, duration),
+        }
     }
 }
 
-pub fn pytimedelta_as_duration(py_timedelta: &PyDelta) -> Duration {
+impl<'a> TryFrom<&'a PyAny> for EitherTimedelta<'a> {
+    type Error = PyErr;
+
+    fn try_from(value: &'a PyAny) -> PyResult<Self> {
+        if let Ok(dt) = <PyDelta as PyTryFrom>::try_from_exact(value) {
+            Ok(EitherTimedelta::PyExact(dt))
+        } else {
+            let dt = value.downcast::<PyDelta>()?;
+            Ok(EitherTimedelta::PySubclass(dt))
+        }
+    }
+}
+
+pub fn pytimedelta_exact_as_duration(py_timedelta: &PyDelta) -> Duration {
     // see https://docs.python.org/3/c-api/datetime.html#c.PyDateTime_DELTA_GET_DAYS
     // days can be negative, but seconds and microseconds are always positive.
     let mut days = py_timedelta.get_days(); // -999999999 to 999999999
@@ -114,20 +146,20 @@ pub fn pytimedelta_as_duration(py_timedelta: &PyDelta) -> Duration {
     Duration::new(positive, days as u32, seconds as u32, microseconds as u32).unwrap()
 }
 
-impl<'a> EitherTimedelta<'a> {
-    pub fn as_raw(&self) -> Duration {
-        match self {
-            Self::Raw(timedelta) => timedelta.clone(),
-            Self::Py(py_timedelta) => pytimedelta_as_duration(py_timedelta),
-        }
+pub fn pytimedelta_subclass_as_duration(py_timedelta: &PyDelta) -> PyResult<Duration> {
+    let total_seconds: f64 = py_timedelta
+        .call_method0(intern!(py_timedelta.py(), "total_seconds"))?
+        .extract()?;
+    if total_seconds.is_nan() {
+        return py_err!(PyValueError; "NaN values not permitted");
     }
-
-    pub fn try_into_py(&self, py: Python<'a>) -> PyResult<&'a PyDelta> {
-        match self {
-            Self::Py(timedelta) => Ok(*timedelta),
-            Self::Raw(duration) => duration_as_pytimedelta(py, duration),
-        }
-    }
+    let positive = total_seconds >= 0_f64;
+    let total_seconds = total_seconds.abs();
+    let microsecond = total_seconds.fract() * 1_000_000.0;
+    let days = (total_seconds / 86400f64) as u32;
+    let seconds = total_seconds as u64 % 86400;
+    Duration::new(positive, days, seconds as u32, microsecond.round() as u32)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 pub fn duration_as_pytimedelta<'py>(py: Python<'py>, duration: &Duration) -> PyResult<&'py PyDelta> {
@@ -194,7 +226,7 @@ impl<'a> EitherTime<'a> {
 fn time_as_tzinfo<'py>(py: Python<'py>, time: &Time) -> PyResult<Option<&'py PyTzInfo>> {
     match time.tz_offset {
         Some(offset) => {
-            let tz_info = TzInfo::new(offset);
+            let tz_info: TzInfo = offset.try_into()?;
             let py_tz_info = Py::new(py, tz_info)?.to_object(py).into_ref(py);
             Ok(Some(py_tz_info.extract()?))
         }
@@ -260,6 +292,7 @@ pub fn bytes_as_date<'a>(input: &'a impl Input<'a>, bytes: &[u8]) -> ValResult<'
         Err(err) => Err(ValError::new(
             ErrorType::DateParsing {
                 error: Cow::Borrowed(err.get_documentation().unwrap_or_default()),
+                context: None,
             },
             input,
         )),
@@ -282,6 +315,7 @@ pub fn bytes_as_time<'a>(
         Err(err) => Err(ValError::new(
             ErrorType::TimeParsing {
                 error: Cow::Borrowed(err.get_documentation().unwrap_or_default()),
+                context: None,
             },
             input,
         )),
@@ -304,6 +338,7 @@ pub fn bytes_as_datetime<'a, 'b>(
         Err(err) => Err(ValError::new(
             ErrorType::DatetimeParsing {
                 error: Cow::Borrowed(err.get_documentation().unwrap_or_default()),
+                context: None,
             },
             input,
         )),
@@ -327,6 +362,7 @@ pub fn int_as_datetime<'a>(
         Err(err) => Err(ValError::new(
             ErrorType::DatetimeParsing {
                 error: Cow::Borrowed(err.get_documentation().unwrap_or_default()),
+                context: None,
             },
             input,
         )),
@@ -339,6 +375,7 @@ macro_rules! nan_check {
             return Err(ValError::new(
                 ErrorType::$error_type {
                     error: Cow::Borrowed("NaN values not permitted"),
+                    context: None,
                 },
                 $input,
             ));
@@ -382,6 +419,7 @@ pub fn int_as_time<'a>(
             return Err(ValError::new(
                 ErrorType::TimeParsing {
                     error: Cow::Borrowed("time in seconds should be positive"),
+                    context: None,
                 },
                 input,
             ));
@@ -403,6 +441,7 @@ pub fn int_as_time<'a>(
         Err(err) => Err(ValError::new(
             ErrorType::TimeParsing {
                 error: Cow::Borrowed(err.get_documentation().unwrap_or_default()),
+                context: None,
             },
             input,
         )),
@@ -420,6 +459,7 @@ fn map_timedelta_err<'a>(input: &'a impl Input<'a>, err: ParseError) -> ValError
     ValError::new(
         ErrorType::TimeDeltaParsing {
             error: Cow::Borrowed(err.get_documentation().unwrap_or_default()),
+            context: None,
         },
         input,
     )
@@ -472,11 +512,11 @@ pub struct TzInfo {
 #[pymethods]
 impl TzInfo {
     #[new]
-    fn new(seconds: i32) -> Self {
-        Self { seconds }
+    fn py_new(seconds: f32) -> PyResult<Self> {
+        Self::try_from(seconds.trunc() as i32)
     }
 
-    fn utcoffset<'p>(&self, py: Python<'p>, _dt: &PyAny) -> PyResult<&'p PyDelta> {
+    fn utcoffset<'py>(&self, py: Python<'py>, _dt: &PyAny) -> PyResult<&'py PyDelta> {
         PyDelta::new(py, 0, self.seconds, 0, true)
     }
 
@@ -488,17 +528,43 @@ impl TzInfo {
         None
     }
 
+    fn fromutc<'py>(&self, dt: &'py PyDateTime) -> PyResult<&'py PyAny> {
+        let py = dt.py();
+        dt.call_method1("__add__", (self.utcoffset(py, py.None().as_ref(py))?,))
+    }
+
     fn __repr__(&self) -> String {
         format!("TzInfo({})", self.__str__())
     }
 
     fn __str__(&self) -> String {
         if self.seconds == 0 {
-            "UTC".to_string()
-        } else {
-            let mins = self.seconds / 60;
-            format!("{:+03}:{:02}", mins / 60, (mins % 60).abs())
+            return "UTC".to_string();
         }
+
+        let (mins, seconds) = (self.seconds / 60, self.seconds % 60);
+        let mut result = format!(
+            "{}{:02}:{:02}",
+            if self.seconds.signum() >= 0 { "+" } else { "-" },
+            (mins / 60).abs(),
+            (mins % 60).abs()
+        );
+
+        if seconds != 0 {
+            result.push_str(&format!(":{:02}", seconds.abs()));
+        }
+
+        result
+    }
+
+    fn __hash__(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.seconds.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+        op.matches(self.seconds.cmp(&other.seconds))
     }
 
     fn __deepcopy__(&self, py: Python, _memo: &PyDict) -> PyResult<Py<Self>> {
@@ -509,5 +575,19 @@ impl TzInfo {
         let args = (self.seconds,);
         let cls = Py::new(py, self.clone())?.getattr(py, "__class__")?;
         Ok((cls, args).into_py(py))
+    }
+}
+
+impl TryFrom<i32> for TzInfo {
+    type Error = PyErr;
+
+    fn try_from(seconds: i32) -> PyResult<Self> {
+        if seconds.abs() >= 86400 {
+            Err(PyValueError::new_err(format!(
+                "TzInfo offset must be strictly between -86400 and 86400 (24 hours) seconds, got {seconds}"
+            )))
+        } else {
+            Ok(Self { seconds })
+        }
     }
 }

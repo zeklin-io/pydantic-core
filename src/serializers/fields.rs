@@ -94,6 +94,7 @@ pub struct GeneralFieldsSerializer {
     fields: AHashMap<String, SerField>,
     computed_fields: Option<ComputedFields>,
     mode: FieldsMode,
+    extra_serializer: Option<Box<CombinedSerializer>>,
     // isize because we look up filter via `.hash()` which returns an isize
     filter: SchemaFilter<isize>,
     required_fields: usize,
@@ -103,12 +104,14 @@ impl GeneralFieldsSerializer {
     pub(super) fn new(
         fields: AHashMap<String, SerField>,
         mode: FieldsMode,
+        extra_serializer: Option<CombinedSerializer>,
         computed_fields: Option<ComputedFields>,
     ) -> Self {
         let required_fields = fields.values().filter(|f| f.required).count();
         Self {
             fields,
             mode,
+            extra_serializer: extra_serializer.map(Box::new),
             filter: SchemaFilter::default(),
             computed_fields,
             required_fields,
@@ -205,7 +208,10 @@ impl TypeSerializer for GeneralFieldsSerializer {
                         used_req_fields += 1;
                     }
                 } else if self.mode == FieldsMode::TypedDictAllow {
-                    let value = infer_to_python(value, next_include, next_exclude, &extra)?;
+                    let value = match &self.extra_serializer {
+                        Some(serializer) => serializer.to_python(value, next_include, next_exclude, &extra)?,
+                        None => infer_to_python(value, next_include, next_exclude, &extra)?,
+                    };
                     output_dict.set_item(key, value)?;
                 } else if extra.check == SerCheck::Strict {
                     return Err(PydanticSerializationUnexpectedValue::new_err(None));
@@ -222,12 +228,15 @@ impl TypeSerializer for GeneralFieldsSerializer {
         }
         // this is used to include `__pydantic_extra__` in serialization on models
         if let Some(extra_dict) = extra_dict {
-            for (key, value) in extra_dict.iter() {
+            for (key, value) in extra_dict {
                 if extra.exclude_none && value.is_none() {
                     continue;
                 }
                 if let Some((next_include, next_exclude)) = self.filter.key_filter(key, include, exclude)? {
-                    let value = infer_to_python(value, next_include, next_exclude, &td_extra)?;
+                    let value = match &self.extra_serializer {
+                        Some(serializer) => serializer.to_python(value, next_include, next_exclude, extra)?,
+                        None => infer_to_python(value, next_include, next_exclude, extra)?,
+                    };
                     output_dict.set_item(key, value)?;
                 }
             }
@@ -304,7 +313,7 @@ impl TypeSerializer for GeneralFieldsSerializer {
         }
         // this is used to include `__pydantic_extra__` in serialization on models
         if let Some(extra_dict) = extra_dict {
-            for (key, value) in extra_dict.iter() {
+            for (key, value) in extra_dict {
                 if extra.exclude_none && value.is_none() {
                     continue;
                 }

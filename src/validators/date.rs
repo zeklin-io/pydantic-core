@@ -5,14 +5,13 @@ use speedate::{Date, Time};
 use strum::EnumMessage;
 
 use crate::build_tools::{is_strict, py_schema_error_type};
-use crate::errors::{ErrorType, ValError, ValResult};
+use crate::errors::{ErrorType, ErrorTypeDefaults, ValError, ValResult};
 use crate::input::{EitherDate, Input};
 
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 use crate::validators::datetime::{NowConstraint, NowOp};
 
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
 #[derive(Debug, Clone)]
 pub struct DateValidator {
@@ -39,24 +38,18 @@ impl BuildValidator for DateValidator {
 impl_py_gc_traverse!(DateValidator {});
 
 impl Validator for DateValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        let date = match input.validate_date(extra.strict.unwrap_or(self.strict)) {
+        let strict = state.strict_or(self.strict);
+        let date = match input.validate_date(strict) {
             Ok(date) => date,
-            // if the date error was an internal error, return that immediately
-            Err(ValError::InternalErr(internal_err)) => return Err(ValError::InternalErr(internal_err)),
-            Err(date_err) => match self.strict {
-                // if we're in strict mode, we doing try coercing from a date
-                true => return Err(date_err),
-                // otherwise, try creating a date from a datetime input
-                false => date_from_datetime(input, date_err),
-            }?,
+            // if the error was a parsing error, in lax mode we allow datetimes at midnight
+            Err(line_errors @ ValError::LineErrors(..)) if !strict => date_from_datetime(input)?.ok_or(line_errors)?,
+            Err(otherwise) => return Err(otherwise),
         };
         if let Some(constraints) = &self.constraints {
             let raw_date = date.as_raw()?;
@@ -68,6 +61,7 @@ impl Validator for DateValidator {
                             return Err(ValError::new(
                                 ErrorType::$error {
                                     $constraint: constraint.to_string().into(),
+                                    context: None,
                                 },
                                 input,
                             ));
@@ -91,8 +85,8 @@ impl Validator for DateValidator {
                     let date_compliant = today_constraint.op.compare(c);
                     if !date_compliant {
                         let error_type = match today_constraint.op {
-                            NowOp::Past => ErrorType::DatePast,
-                            NowOp::Future => ErrorType::DateFuture,
+                            NowOp::Past => ErrorTypeDefaults::DatePast,
+                            NowOp::Future => ErrorTypeDefaults::DateFuture,
                         };
                         return Err(ValError::new(error_type, input));
                     }
@@ -102,11 +96,7 @@ impl Validator for DateValidator {
         Ok(date.try_into_py(py)?)
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         !ultra_strict
     }
 
@@ -114,41 +104,38 @@ impl Validator for DateValidator {
         Self::EXPECTED_TYPE
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }
 
 /// In lax mode, if the input is not a date, we try parsing the input as a datetime, then check it is an
 /// "exact date", e.g. has a zero time component.
-fn date_from_datetime<'data>(
-    input: &'data impl Input<'data>,
-    date_err: ValError<'data>,
-) -> ValResult<'data, EitherDate<'data>> {
+///
+/// Ok(None) means that this is not relevant to dates (the input was not a datetime nor a string)
+fn date_from_datetime<'data>(input: &'data impl Input<'data>) -> Result<Option<EitherDate<'data>>, ValError<'data>> {
     let either_dt = match input.validate_datetime(false, speedate::MicrosecondsPrecisionOverflowBehavior::Truncate) {
         Ok(dt) => dt,
-        Err(dt_err) => {
-            return match dt_err {
-                ValError::LineErrors(mut line_errors) => {
-                    // if we got a errors while parsing the datetime,
-                    // convert DateTimeParsing -> DateFromDatetimeParsing but keep the rest of the error unchanged
-                    for line_error in &mut line_errors {
-                        match line_error.error_type {
-                            ErrorType::DatetimeParsing { ref error } => {
-                                line_error.error_type = ErrorType::DateFromDatetimeParsing {
-                                    error: error.to_string(),
-                                };
-                            }
-                            _ => {
-                                return Err(date_err);
-                            }
-                        }
-                    }
-                    Err(ValError::LineErrors(line_errors))
+        // if the error was a parsing error, update the error type from DatetimeParsing to DateFromDatetimeParsing
+        // and return it
+        Err(ValError::LineErrors(mut line_errors)) => {
+            if line_errors.iter_mut().fold(false, |has_parsing_error, line_error| {
+                if let ErrorType::DatetimeParsing { error, .. } = &mut line_error.error_type {
+                    line_error.error_type = ErrorType::DateFromDatetimeParsing {
+                        error: std::mem::take(error),
+                        context: None,
+                    };
+                    true
+                } else {
+                    has_parsing_error
                 }
-                other => Err(other),
-            };
+            }) {
+                return Err(ValError::LineErrors(line_errors));
+            }
+            return Ok(None);
         }
+        // for any other error, don't return it
+        Err(_) => return Ok(None),
     };
     let dt = either_dt.as_raw()?;
     let zero_time = Time {
@@ -159,9 +146,9 @@ fn date_from_datetime<'data>(
         tz_offset: dt.time.tz_offset,
     };
     if dt.time == zero_time {
-        Ok(EitherDate::Raw(dt.date))
+        Ok(Some(EitherDate::Raw(dt.date)))
     } else {
-        Err(ValError::new(ErrorType::DateFromDatetimeInexact, input))
+        Err(ValError::new(ErrorTypeDefaults::DateFromDatetimeInexact, input))
     }
 }
 

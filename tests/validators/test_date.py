@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -5,7 +7,7 @@ from typing import Any, Dict
 
 import pytest
 
-from pydantic_core import SchemaError, SchemaValidator, ValidationError, core_schema
+from pydantic_core import SchemaError, SchemaValidator, ValidationError, core_schema, validate_core_schema
 
 from ..conftest import Err, PyAndJson
 
@@ -127,13 +129,13 @@ def test_date_json(py_and_json: PyAndJson, input_value, expected):
     ],
     ids=repr,
 )
-def test_date_strict(input_value, expected):
-    v = SchemaValidator({'type': 'date', 'strict': True})
+def test_date_strict(input_value, expected, strict_mode_type):
+    v = SchemaValidator({'type': 'date', 'strict': strict_mode_type.schema})
     if isinstance(expected, Err):
         with pytest.raises(ValidationError, match=re.escape(expected.message)):
-            v.validate_python(input_value)
+            v.validate_python(input_value, **strict_mode_type.validator_args)
     else:
-        output = v.validate_python(input_value)
+        output = v.validate_python(input_value, **strict_mode_type.validator_args)
         assert output == expected
 
 
@@ -148,13 +150,13 @@ def test_date_strict(input_value, expected):
         ('1654646400', Err('Input should be a valid date [type=date_type')),
     ],
 )
-def test_date_strict_json(input_value, expected):
-    v = SchemaValidator({'type': 'date', 'strict': True})
+def test_date_strict_json(input_value, expected, strict_mode_type):
+    v = SchemaValidator({'type': 'date', 'strict': strict_mode_type.schema})
     if isinstance(expected, Err):
         with pytest.raises(ValidationError, match=re.escape(expected.message)):
-            v.validate_json(input_value)
+            v.validate_json(input_value, **strict_mode_type.validator_args)
     else:
-        output = v.validate_json(input_value)
+        output = v.validate_json(input_value, **strict_mode_type.validator_args)
         assert output == expected
 
 
@@ -183,9 +185,9 @@ def test_date_strict_json_ctx():
             '2000-01-02',
             Err('Input should be less than or equal to 2000-01-01 [type=less_than_equal,'),
         ),
-        ({'lt': '2000-01-01'}, '1999-12-31', date(1999, 12, 31)),
-        ({'lt': '2000-01-01'}, '2000-01-01', Err('Input should be less than 2000-01-01 [type=less_than,')),
-        ({'ge': '2000-01-01'}, '2000-01-01', date(2000, 1, 1)),
+        ({'lt': date(2000, 1, 1)}, '1999-12-31', date(1999, 12, 31)),
+        ({'lt': date(2000, 1, 1)}, '2000-01-01', Err('Input should be less than 2000-01-01 [type=less_than,')),
+        ({'ge': date(2000, 1, 1)}, '2000-01-01', date(2000, 1, 1)),
         (
             {'ge': date(2000, 1, 1)},
             '1999-12-31',
@@ -195,8 +197,8 @@ def test_date_strict_json_ctx():
         ({'gt': date(2000, 1, 1)}, '2000-01-01', Err('Input should be greater than 2000-01-01 [type=greater_than,')),
     ],
 )
-def test_date_kwargs(kwargs: Dict[str, Any], input_value, expected):
-    v = SchemaValidator({'type': 'date', **kwargs})
+def test_date_kwargs(kwargs: Dict[str, Any], input_value: date, expected: Err | date):
+    v = SchemaValidator({'type': 'date', **kwargs})  # type: ignore
     if isinstance(expected, Err):
         with pytest.raises(ValidationError, match=re.escape(expected.message)):
             v.validate_python(input_value)
@@ -207,7 +209,7 @@ def test_date_kwargs(kwargs: Dict[str, Any], input_value, expected):
 
 def test_invalid_constraint():
     with pytest.raises(SchemaError, match=r'date\.gt\n  Input should be a valid date or datetime'):
-        SchemaValidator({'type': 'date', 'gt': 'foobar'})
+        validate_core_schema({'type': 'date', 'gt': 'foobar'})
 
 
 def test_dict_py():
@@ -288,4 +290,4 @@ def test_date_past_future_today():
 
 def test_offset_too_large():
     with pytest.raises(SchemaError, match=r'Input should be less than 86400 \[type=less_than,'):
-        SchemaValidator(core_schema.date_schema(now_op='past', now_utc_offset=24 * 3600))
+        validate_core_schema(core_schema.date_schema(now_op='past', now_utc_offset=24 * 3600))

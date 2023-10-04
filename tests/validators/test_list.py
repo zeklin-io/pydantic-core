@@ -160,7 +160,12 @@ def test_list_error(input_value, index):
         (
             {'max_length': 44},
             infinite_generator(),
-            Err('List should have at most 44 items after validation, not 45 [type=too_long,'),
+            Err('List should have at most 44 items after validation, not more [type=too_long,'),
+        ),
+        (
+            {'max_length': 4, 'items_schema': {'type': 'int'}},
+            [0, 1, 2, 3, 4, 5, 6, 7, 8],
+            Err('List should have at most 4 items after validation, not 9 [type=too_long,'),
         ),
     ],
 )
@@ -230,9 +235,7 @@ def test_list_function():
     def f(input_value, info):
         return input_value * 2
 
-    v = SchemaValidator(
-        {'type': 'list', 'items_schema': {'type': 'function-plain', 'function': {'type': 'general', 'function': f}}}
-    )
+    v = SchemaValidator({'type': 'list', 'items_schema': core_schema.with_info_plain_validator_function(f)})
 
     assert v.validate_python([1, 2, 3]) == [2, 4, 6]
 
@@ -241,9 +244,7 @@ def test_list_function_val_error():
     def f(input_value, info):
         raise ValueError(f'error {input_value}')
 
-    v = SchemaValidator(
-        {'type': 'list', 'items_schema': {'type': 'function-plain', 'function': {'type': 'general', 'function': f}}}
-    )
+    v = SchemaValidator({'type': 'list', 'items_schema': core_schema.with_info_plain_validator_function(f)})
 
     with pytest.raises(ValidationError) as exc_info:
         v.validate_python([1, 2])
@@ -269,9 +270,7 @@ def test_list_function_internal_error():
     def f(input_value, info):
         raise RuntimeError(f'error {input_value}')
 
-    v = SchemaValidator(
-        {'type': 'list', 'items_schema': {'type': 'function-plain', 'function': {'type': 'general', 'function': f}}}
-    )
+    v = SchemaValidator({'type': 'list', 'items_schema': core_schema.with_info_plain_validator_function(f)})
 
     with pytest.raises(RuntimeError, match='^error 1$') as exc_info:
         v.validate_python([1, 2])
@@ -391,9 +390,9 @@ def test_max_length_fail_fast(error_in_func: bool) -> None:
         {
             'type': 'too_long',
             'loc': (),
-            'msg': 'List should have at most 10 items after validation, not 11',
+            'msg': 'List should have at most 10 items after validation, not 15',
             'input': data,
-            'ctx': {'field_type': 'List', 'max_length': 10, 'actual_length': 11},
+            'ctx': {'field_type': 'List', 'max_length': 10, 'actual_length': 15},
         }
     )
 

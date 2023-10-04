@@ -6,14 +6,14 @@ use regex::Regex;
 use crate::build_tools::{is_strict, py_schema_error_type, schema_or_config};
 use crate::errors::{ErrorType, ValError, ValResult};
 use crate::input::Input;
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StrValidator {
     strict: bool,
+    coerce_numbers_to_str: bool,
 }
 
 impl BuildValidator for StrValidator {
@@ -31,6 +31,7 @@ impl BuildValidator for StrValidator {
         } else {
             Ok(Self {
                 strict: con_str_validator.strict,
+                coerce_numbers_to_str: con_str_validator.coerce_numbers_to_str,
             }
             .into())
         }
@@ -40,22 +41,17 @@ impl BuildValidator for StrValidator {
 impl_py_gc_traverse!(StrValidator {});
 
 impl Validator for StrValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        Ok(input.validate_str(extra.strict.unwrap_or(self.strict))?.into_py(py))
+        let either_str = input.validate_str(state.strict_or(self.strict), self.coerce_numbers_to_str)?;
+        Ok(either_str.into_py(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         !ultra_strict
     }
 
@@ -63,7 +59,7 @@ impl Validator for StrValidator {
         Self::EXPECTED_TYPE
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }
@@ -72,26 +68,25 @@ impl Validator for StrValidator {
 #[derive(Debug, Clone, Default)]
 pub struct StrConstrainedValidator {
     strict: bool,
-    pattern: Option<Regex>,
+    pattern: Option<Pattern>,
     max_length: Option<usize>,
     min_length: Option<usize>,
     strip_whitespace: bool,
     to_lower: bool,
     to_upper: bool,
+    coerce_numbers_to_str: bool,
 }
 
 impl_py_gc_traverse!(StrConstrainedValidator {});
 
 impl Validator for StrConstrainedValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        let either_str = input.validate_str(extra.strict.unwrap_or(self.strict))?;
+        let either_str = input.validate_str(state.strict_or(self.strict), self.coerce_numbers_to_str)?;
         let cow = either_str.as_cow()?;
         let mut str = cow.as_ref();
         if self.strip_whitespace {
@@ -105,20 +100,33 @@ impl Validator for StrConstrainedValidator {
         };
         if let Some(min_length) = self.min_length {
             if str_len.unwrap() < min_length {
-                return Err(ValError::new(ErrorType::StringTooShort { min_length }, input));
+                return Err(ValError::new(
+                    ErrorType::StringTooShort {
+                        min_length,
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
         if let Some(max_length) = self.max_length {
             if str_len.unwrap() > max_length {
-                return Err(ValError::new(ErrorType::StringTooLong { max_length }, input));
+                return Err(ValError::new(
+                    ErrorType::StringTooLong {
+                        max_length,
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
 
         if let Some(pattern) = &self.pattern {
-            if !pattern.is_match(str) {
+            if !pattern.is_match(py, str)? {
                 return Err(ValError::new(
                     ErrorType::StringPatternMismatch {
-                        pattern: pattern.to_string(),
+                        pattern: pattern.pattern.clone(),
+                        context: None,
                     },
                     input,
                 ));
@@ -138,11 +146,7 @@ impl Validator for StrConstrainedValidator {
         Ok(py_string.into_py(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         !ultra_strict
     }
 
@@ -150,7 +154,7 @@ impl Validator for StrConstrainedValidator {
         "constrained-str"
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }
@@ -158,10 +162,16 @@ impl Validator for StrConstrainedValidator {
 impl StrConstrainedValidator {
     fn build(schema: &PyDict, config: Option<&PyDict>) -> PyResult<Self> {
         let py = schema.py();
-        let pattern = match schema.get_as(intern!(py, "pattern"))? {
-            Some(s) => Some(Regex::new(s).map_err(|e| py_schema_error_type!("{}", e))?),
-            None => None,
-        };
+
+        let pattern = schema
+            .get_as(intern!(py, "pattern"))?
+            .map(|s| {
+                let regex_engine =
+                    schema_or_config(schema, config, intern!(py, "regex_engine"), intern!(py, "regex_engine"))?
+                        .unwrap_or(RegexEngine::RUST_REGEX);
+                Pattern::compile(py, s, regex_engine)
+            })
+            .transpose()?;
         let min_length: Option<usize> =
             schema_or_config(schema, config, intern!(py, "min_length"), intern!(py, "str_min_length"))?;
         let max_length: Option<usize> =
@@ -179,6 +189,11 @@ impl StrConstrainedValidator {
         let to_upper: bool =
             schema_or_config(schema, config, intern!(py, "to_upper"), intern!(py, "str_to_upper"))?.unwrap_or(false);
 
+        let coerce_numbers_to_str = config
+            .and_then(|c| c.get_item("coerce_numbers_to_str"))
+            .and_then(|v| v.is_true().ok())
+            .unwrap_or(false);
+
         Ok(Self {
             strict: is_strict(schema, config)?,
             pattern,
@@ -187,6 +202,7 @@ impl StrConstrainedValidator {
             strip_whitespace,
             to_lower,
             to_upper,
+            coerce_numbers_to_str,
         })
     }
 
@@ -199,5 +215,47 @@ impl StrConstrainedValidator {
             || self.strip_whitespace
             || self.to_lower
             || self.to_upper
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Pattern {
+    pattern: String,
+    engine: RegexEngine,
+}
+
+#[derive(Debug, Clone)]
+enum RegexEngine {
+    RustRegex(Regex),
+    PythonRe(PyObject),
+}
+
+impl RegexEngine {
+    const RUST_REGEX: &'static str = "rust-regex";
+    const PYTHON_RE: &'static str = "python-re";
+}
+
+impl Pattern {
+    fn compile(py: Python<'_>, pattern: String, engine: &str) -> PyResult<Self> {
+        let engine = match engine {
+            RegexEngine::RUST_REGEX => {
+                RegexEngine::RustRegex(Regex::new(&pattern).map_err(|e| py_schema_error_type!("{}", e))?)
+            }
+            RegexEngine::PYTHON_RE => {
+                let re_compile = py.import(intern!(py, "re"))?.getattr(intern!(py, "compile"))?;
+                RegexEngine::PythonRe(re_compile.call1((&pattern,))?.into())
+            }
+            _ => return Err(py_schema_error_type!("Invalid regex engine: {}", engine)),
+        };
+        Ok(Self { pattern, engine })
+    }
+
+    fn is_match(&self, py: Python<'_>, target: &str) -> PyResult<bool> {
+        match &self.engine {
+            RegexEngine::RustRegex(regex) => Ok(regex.is_match(target)),
+            RegexEngine::PythonRe(py_regex) => {
+                Ok(!py_regex.call_method1(py, intern!(py, "match"), (target,))?.is_none(py))
+            }
+        }
     }
 }

@@ -21,7 +21,6 @@ use super::errors::se_err_py_err;
 use super::extra::Extra;
 use super::infer::infer_json_key;
 use super::ob_type::{IsType, ObType};
-use super::type_serializers::definitions::DefinitionRefSerializer;
 
 pub(crate) trait BuildSerializer: Sized {
     const EXPECTED_TYPE: &'static str;
@@ -114,6 +113,7 @@ combined_serializer! {
         Int: super::type_serializers::simple::IntSerializer;
         Bool: super::type_serializers::simple::BoolSerializer;
         Float: super::type_serializers::simple::FloatSerializer;
+        Decimal: super::type_serializers::decimal::DecimalSerializer;
         Str: super::type_serializers::string::StrSerializer;
         Bytes: super::type_serializers::bytes::BytesSerializer;
         Datetime: super::type_serializers::datetime_etc::DatetimeSerializer;
@@ -206,13 +206,6 @@ impl BuildSerializer for CombinedSerializer {
         config: Option<&PyDict>,
         definitions: &mut DefinitionsBuilder<CombinedSerializer>,
     ) -> PyResult<CombinedSerializer> {
-        let py: Python = schema.py();
-        if let Some(schema_ref) = schema.get_as::<String>(intern!(py, "ref"))? {
-            let inner_ser = Self::_build(schema, config, definitions)?;
-            let ser_id = definitions.add_definition(schema_ref, inner_ser)?;
-            return Ok(DefinitionRefSerializer::from_id(ser_id));
-        }
-
         Self::_build(schema, config, definitions)
     }
 }
@@ -229,6 +222,7 @@ impl PyGcTraverse for CombinedSerializer {
             CombinedSerializer::Int(inner) => inner.py_gc_traverse(visit),
             CombinedSerializer::Bool(inner) => inner.py_gc_traverse(visit),
             CombinedSerializer::Float(inner) => inner.py_gc_traverse(visit),
+            CombinedSerializer::Decimal(inner) => inner.py_gc_traverse(visit),
             CombinedSerializer::Str(inner) => inner.py_gc_traverse(visit),
             CombinedSerializer::Bytes(inner) => inner.py_gc_traverse(visit),
             CombinedSerializer::Datetime(inner) => inner.py_gc_traverse(visit),
@@ -388,7 +382,7 @@ pub(super) fn dataclass_to_dict(dc: &PyAny) -> PyResult<&PyDict> {
     let dict = PyDict::new(py);
 
     let field_type_marker = get_field_marker(py)?;
-    for (field_name, field) in dc_fields.iter() {
+    for (field_name, field) in dc_fields {
         let field_type = field.getattr(intern!(py, "_field_type"))?;
         if field_type.is(field_type_marker) {
             let field_name: &PyString = field_name.downcast()?;

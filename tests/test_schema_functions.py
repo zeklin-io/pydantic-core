@@ -108,32 +108,36 @@ all_schema_functions = [
         {'type': 'dict', 'keys_schema': {'type': 'str'}, 'values_schema': {'type': 'int'}},
     ),
     (
-        core_schema.general_before_validator_function,
+        core_schema.with_info_before_validator_function,
         args(val_function, {'type': 'int'}),
         {
             'type': 'function-before',
-            'function': {'type': 'general', 'function': val_function},
+            'function': {'type': 'with-info', 'function': val_function},
             'schema': {'type': 'int'},
         },
     ),
     (
-        core_schema.general_after_validator_function,
+        core_schema.with_info_after_validator_function,
         args(val_function, {'type': 'int'}),
         {
             'type': 'function-after',
-            'function': {'type': 'general', 'function': val_function},
+            'function': {'type': 'with-info', 'function': val_function},
             'schema': {'type': 'int'},
         },
     ),
     (
-        core_schema.general_wrap_validator_function,
+        core_schema.with_info_wrap_validator_function,
         args(val_function, {'type': 'int'}),
-        {'type': 'function-wrap', 'function': {'type': 'general', 'function': val_function}, 'schema': {'type': 'int'}},
+        {
+            'type': 'function-wrap',
+            'function': {'type': 'with-info', 'function': val_function},
+            'schema': {'type': 'int'},
+        },
     ),
     (
-        core_schema.general_plain_validator_function,
+        core_schema.with_info_plain_validator_function,
         args(val_function),
-        {'type': 'function-plain', 'function': {'type': 'general', 'function': val_function}},
+        core_schema.with_info_plain_validator_function(val_function),
     ),
     (
         core_schema.with_default_schema,
@@ -255,8 +259,12 @@ all_schema_functions = [
     (core_schema.is_subclass_schema, args(MyModel), {'type': 'is-subclass', 'cls': MyModel}),
     (
         core_schema.definitions_schema,
-        args({'type': 'int'}, [{'type': 'int'}]),
-        {'type': 'definitions', 'schema': {'type': 'int'}, 'definitions': [{'type': 'int'}]},
+        args({'type': 'definition-ref', 'schema_ref': 'an-int'}, [{'type': 'int', 'ref': 'an-int'}]),
+        {
+            'type': 'definitions',
+            'schema': {'type': 'definition-ref', 'schema_ref': 'an-int'},
+            'definitions': [{'type': 'int', 'ref': 'an-int'}],
+        },
     ),
     (core_schema.definition_reference_schema, args('foo'), {'type': 'definition-ref', 'schema_ref': 'foo'}),
     (
@@ -279,6 +287,8 @@ all_schema_functions = [
         {'type': 'dataclass', 'schema': {'type': 'int'}, 'fields': ['foobar'], 'cls': MyDataclass, 'slots': True},
     ),
     (core_schema.uuid_schema, args(), {'type': 'uuid'}),
+    (core_schema.decimal_schema, args(), {'type': 'decimal'}),
+    (core_schema.decimal_schema, args(multiple_of=5, gt=1.2), {'type': 'decimal', 'multiple_of': 5, 'gt': 1.2}),
 ]
 
 

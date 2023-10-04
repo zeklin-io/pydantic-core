@@ -1,11 +1,15 @@
+import enum
 import re
+import sys
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
+from unittest.mock import patch
 
 import pytest
 from dirty_equals import HasRepr, IsInstance, IsJson, IsStr
 
 from pydantic_core import (
+    CoreConfig,
     PydanticCustomError,
     PydanticKnownError,
     PydanticOmit,
@@ -32,6 +36,20 @@ def test_pydantic_value_error():
     )
 
 
+@pytest.mark.parametrize(
+    'msg,result_msg', [('my custom error', 'my custom error'), ('my custom error {foo}', "my custom error {'bar': []}")]
+)
+def test_pydantic_value_error_nested_ctx(msg: str, result_msg: str):
+    ctx = {'foo': {'bar': []}}
+    e = PydanticCustomError('my_error', msg, ctx)
+    assert e.message() == result_msg
+    assert e.message_template == msg
+    assert e.type == 'my_error'
+    assert e.context == ctx
+    assert str(e) == result_msg
+    assert repr(e) == f'{result_msg} [type=my_error, context={ctx}]'
+
+
 def test_pydantic_value_error_none():
     e = PydanticCustomError('my_error', 'this is a custom error {missed}')
     assert e.message() == 'this is a custom error {missed}'
@@ -46,7 +64,7 @@ def test_pydantic_value_error_usage():
     def f(input_value, info):
         raise PydanticCustomError('my_error', 'this is a custom error {foo} {bar}', {'foo': 'FOOBAR', 'bar': 42})
 
-    v = SchemaValidator({'type': 'function-plain', 'function': {'type': 'general', 'function': f}})
+    v = SchemaValidator(core_schema.with_info_plain_validator_function(f))
 
     with pytest.raises(ValidationError) as exc_info:
         v.validate_python(42)
@@ -66,7 +84,7 @@ def test_pydantic_value_error_invalid_dict():
     def my_function(input_value, info):
         raise PydanticCustomError('my_error', 'this is a custom error {foo}', {(): 'foobar'})
 
-    v = SchemaValidator({'type': 'function-plain', 'function': {'type': 'general', 'function': my_function}})
+    v = SchemaValidator(core_schema.with_info_plain_validator_function(my_function))
 
     with pytest.raises(ValidationError) as exc_info:
         v.validate_python(42)
@@ -84,7 +102,7 @@ def test_pydantic_value_error_invalid_type():
     def f(input_value, info):
         raise PydanticCustomError('my_error', 'this is a custom error {foo}', [('foo', 123)])
 
-    v = SchemaValidator({'type': 'function-plain', 'function': {'type': 'general', 'function': f}})
+    v = SchemaValidator(core_schema.with_info_plain_validator_function(f))
 
     with pytest.raises(TypeError, match="argument 'context': 'list' object cannot be converted to 'PyDict'"):
         v.validate_python(42)
@@ -100,9 +118,7 @@ def test_validator_instance_plain():
             return f'{input_value} {self.foo} {self.bar}'
 
     c = CustomValidator()
-    v = SchemaValidator(
-        {'type': 'function-plain', 'metadata': {'instance': c}, 'function': {'type': 'general', 'function': c.validate}}
-    )
+    v = SchemaValidator(core_schema.with_info_plain_validator_function(c.validate, metadata={'instance': c}))
     c.foo += 1
 
     assert v.validate_python('input value') == 'input value 43 before'
@@ -121,12 +137,7 @@ def test_validator_instance_after():
 
     c = CustomValidator()
     v = SchemaValidator(
-        {
-            'type': 'function-after',
-            'metadata': {'instance': c},
-            'function': {'type': 'general', 'function': c.validate},
-            'schema': {'type': 'str'},
-        }
+        core_schema.with_info_after_validator_function(c.validate, core_schema.str_schema(), metadata={'instance': c})
     )
     c.foo += 1
 
@@ -143,13 +154,21 @@ def test_pydantic_error_type():
     assert repr(e) == "Invalid JSON: Test [type=json_invalid, context={'error': 'Test'}]"
 
 
+def test_pydantic_error_type_nested_ctx():
+    ctx = {'error': 'Test', 'foo': {'bar': []}}
+    e = PydanticKnownError('json_invalid', ctx)
+    assert e.message() == 'Invalid JSON: Test'
+    assert e.type == 'json_invalid'
+    assert e.context == ctx
+    assert str(e) == 'Invalid JSON: Test'
+    assert repr(e) == f'Invalid JSON: Test [type=json_invalid, context={ctx}]'
+
+
 def test_pydantic_error_type_raise_no_ctx():
     def f(input_value, info):
         raise PydanticKnownError('finite_number')
 
-    v = SchemaValidator(
-        {'type': 'function-before', 'function': {'type': 'general', 'function': f}, 'schema': {'type': 'int'}}
-    )
+    v = SchemaValidator(core_schema.with_info_before_validator_function(f, core_schema.int_schema()))
 
     with pytest.raises(ValidationError) as exc_info:
         v.validate_python(4)
@@ -159,19 +178,75 @@ def test_pydantic_error_type_raise_no_ctx():
     ]
 
 
-def test_pydantic_error_type_raise_ctx():
-    def f(input_value, info):
-        raise PydanticKnownError('greater_than', {'gt': 42})
+@pytest.mark.parametrize(
+    'extra', [{}, {'foo': 1}, {'foo': {'bar': []}}, {'foo': {'bar': object()}}, {'foo': Decimal('42.1')}]
+)
+def test_pydantic_error_type_raise_ctx(extra: dict):
+    ctx = {'gt': 42, **extra}
 
-    v = SchemaValidator(
-        {'type': 'function-before', 'function': {'type': 'general', 'function': f}, 'schema': {'type': 'int'}}
-    )
+    def f(input_value, info):
+        raise PydanticKnownError('greater_than', ctx)
+
+    v = SchemaValidator(core_schema.with_info_before_validator_function(f, core_schema.int_schema()))
 
     with pytest.raises(ValidationError) as exc_info:
         v.validate_python(4)
     # insert_assert(exc_info.value.errors(include_url=False))
     assert exc_info.value.errors(include_url=False) == [
-        {'type': 'greater_than', 'loc': (), 'msg': 'Input should be greater than 42', 'input': 4, 'ctx': {'gt': 42.0}}
+        {'type': 'greater_than', 'loc': (), 'msg': 'Input should be greater than 42', 'input': 4, 'ctx': ctx}
+    ]
+
+
+@pytest.mark.parametrize('ctx', [None, {}])
+def test_pydantic_error_type_raise_custom_no_ctx(ctx: Optional[dict]):
+    def f(input_value, info):
+        raise PydanticKnownError('int_type', ctx)
+
+    v = SchemaValidator(core_schema.with_info_before_validator_function(f, core_schema.int_schema()))
+
+    expect_ctx = {'ctx': {}} if ctx is not None else {}
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python(4)
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'int_type', 'loc': (), 'msg': 'Input should be a valid integer', 'input': 4, **expect_ctx}
+    ]
+
+
+@pytest.mark.parametrize(
+    'extra', [{}, {'foo': 1}, {'foo': {'bar': []}}, {'foo': {'bar': object()}}, {'foo': Decimal('42.1')}]
+)
+def test_pydantic_custom_error_type_raise_custom_ctx(extra: dict):
+    ctx = {'val': 42, **extra}
+
+    def f(input_value, info):
+        raise PydanticCustomError('my_error', 'my message with {val}', ctx)
+
+    v = SchemaValidator(core_schema.with_info_before_validator_function(f, core_schema.int_schema()))
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python(4)
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'my_error', 'loc': (), 'msg': 'my message with 42', 'input': 4, 'ctx': ctx}
+    ]
+
+
+@pytest.mark.parametrize('ctx', [None, {}])
+def test_pydantic_custom_error_type_raise_custom_no_ctx(ctx: Optional[dict]):
+    def f(input_value, info):
+        raise PydanticCustomError('my_error', 'my message', ctx)
+
+    v = SchemaValidator(core_schema.with_info_before_validator_function(f, core_schema.int_schema()))
+
+    expect_ctx = {'ctx': {}} if ctx is not None else {}
+
+    with pytest.raises(ValidationError) as exc_info:
+        v.validate_python(4)
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {'type': 'my_error', 'loc': (), 'msg': 'my message', 'input': 4, **expect_ctx}
     ]
 
 
@@ -285,6 +360,15 @@ all_errors = [
     ('uuid_type', 'UUID input should be a string, bytes or UUID object', None),
     ('uuid_parsing', 'Input should be a valid UUID, Foobar', {'error': 'Foobar'}),
     ('uuid_version', 'UUID version 42 expected', {'expected_version': 42}),
+    ('decimal_type', 'Decimal input should be an integer, float, string or Decimal object', None),
+    ('decimal_parsing', 'Input should be a valid decimal', None),
+    ('decimal_max_digits', 'Decimal input should have no more than 42 digits in total', {'max_digits': 42}),
+    ('decimal_max_places', 'Decimal input should have no more than 42 decimal places', {'decimal_places': 42}),
+    (
+        'decimal_whole_digits',
+        'Decimal input should have no more than 42 digits before the decimal point',
+        {'whole_digits': 42},
+    ),
 ]
 
 
@@ -306,7 +390,7 @@ def test_error_decimal():
     e = PydanticKnownError('greater_than', {'gt': Decimal('42.1')})
     assert e.message() == 'Input should be greater than 42.1'
     assert e.type == 'greater_than'
-    assert e.context == {'gt': 42.1}
+    assert e.context == {'gt': Decimal('42.1')}
 
 
 def test_custom_error_decimal():
@@ -321,28 +405,19 @@ def test_pydantic_value_error_plain(py_and_json: PyAndJson):
     def f(input_value, info):
         raise PydanticCustomError
 
-    v = py_and_json({'type': 'function-plain', 'function': {'type': 'general', 'function': f}})
+    v = py_and_json(core_schema.with_info_plain_validator_function(f))
     with pytest.raises(TypeError, match='missing 2 required positional arguments'):
         v.validate_test('4')
 
 
 @pytest.mark.parametrize('exception', [PydanticOmit(), PydanticOmit])
 def test_list_omit_exception(py_and_json: PyAndJson, exception):
-    def f(input_value, info):
+    def f(input_value):
         if input_value % 2 == 0:
             raise exception
         return input_value
 
-    v = py_and_json(
-        {
-            'type': 'list',
-            'items_schema': {
-                'type': 'function-after',
-                'schema': {'type': 'int'},
-                'function': {'type': 'general', 'function': f},
-            },
-        }
-    )
+    v = py_and_json(core_schema.list_schema(core_schema.no_info_after_validator_function(f, core_schema.int_schema())))
     assert v.validate_test([1, 2, '3', '4']) == [1, 3]
 
 
@@ -351,14 +426,23 @@ def test_omit_exc_repr():
     assert str(PydanticOmit()) == 'PydanticOmit()'
 
 
-def test_type_error_error():
-    with pytest.raises(TypeError, match="^GreaterThan: 'gt' context value must be a Number$"):
-        PydanticKnownError('greater_than', {'gt': []})
+@pytest.mark.parametrize(
+    'error,ctx,expect',
+    [
+        ('greater_than', {'gt': []}, "GreaterThan: 'gt' context value must be a Number"),
+        ('model_type', {'class_name': []}, "ModelType: 'class_name' context value must be a String"),
+        ('date_parsing', {'error': []}, "DateParsing: 'error' context value must be a String"),
+        ('string_too_short', {'min_length': []}, "StringTooShort: 'min_length' context value must be a usize"),
+    ],
+)
+def test_type_error_error(error: str, ctx: dict, expect: str):
+    with pytest.raises(TypeError, match=f'^{expect}$'):
+        PydanticKnownError(error, ctx)
 
 
-def test_does_not_require_context():
-    with pytest.raises(TypeError, match="^'json_type' errors do not require context$"):
-        PydanticKnownError('json_type', {'gt': 123})
+def test_custom_context_for_simple_error():
+    err = PydanticKnownError('json_type', {'foo': 'bar'})
+    assert err.context == {'foo': 'bar'}
 
 
 def test_all_errors():
@@ -409,6 +493,212 @@ def test_all_errors():
         literal = ''.join(f'\n    {e!r},' for e in error_types)
         print(f'python code (end of python/pydantic_core/core_schema.py):\n\nErrorType = Literal[{literal}\n]')
         pytest.fail('core_schema.ErrorType needs to be updated')
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason='This is the modern version used post 3.10.')
+def test_validation_error_cause_contents():
+    enabled_config: CoreConfig = {'validation_error_cause': True}
+
+    def multi_raise_py_error(v: Any) -> Any:
+        try:
+            raise AssertionError('Wrong')
+        except AssertionError as e:
+            raise ValueError('Oh no!') from e
+
+    s2 = SchemaValidator(core_schema.no_info_plain_validator_function(multi_raise_py_error), config=enabled_config)
+    with pytest.raises(ValidationError) as exc_info:
+        s2.validate_python('anything')
+
+    cause_group = exc_info.value.__cause__
+    assert isinstance(cause_group, BaseExceptionGroup)
+    assert len(cause_group.exceptions) == 1
+
+    cause = cause_group.exceptions[0]
+    assert cause.__notes__
+    assert cause.__notes__[-1].startswith('\nPydantic: ')
+    assert repr(cause) == repr(ValueError('Oh no!'))
+    assert cause.__traceback__ is not None
+
+    sub_cause = cause.__cause__
+    assert repr(sub_cause) == repr(AssertionError('Wrong'))
+    assert sub_cause.__cause__ is None
+    assert sub_cause.__traceback__ is not None
+
+    # Edge case: make sure a deep inner ValidationError(s) causing a validator failure doesn't cause any problems:
+    def outer_raise_py_error(v: Any) -> Any:
+        try:
+            s2.validate_python('anything')
+        except ValidationError as e:
+            raise ValueError('Sub val failure') from e
+
+    s3 = SchemaValidator(core_schema.no_info_plain_validator_function(outer_raise_py_error), config=enabled_config)
+    with pytest.raises(ValidationError) as exc_info:
+        s3.validate_python('anything')
+
+    assert isinstance(exc_info.value.__cause__, BaseExceptionGroup)
+    assert len(exc_info.value.__cause__.exceptions) == 1
+    cause = exc_info.value.__cause__.exceptions[0]
+    assert cause.__notes__ and cause.__notes__[-1].startswith('\nPydantic: ')
+    assert repr(cause) == repr(ValueError('Sub val failure'))
+    subcause = cause.__cause__
+    assert isinstance(subcause, ValidationError)
+
+    cause_group = subcause.__cause__
+    assert isinstance(cause_group, BaseExceptionGroup)
+    assert len(cause_group.exceptions) == 1
+
+    cause = cause_group.exceptions[0]
+    assert cause.__notes__
+    assert cause.__notes__[-1].startswith('\nPydantic: ')
+    assert repr(cause) == repr(ValueError('Oh no!'))
+    assert cause.__traceback__ is not None
+
+    sub_cause = cause.__cause__
+    assert repr(sub_cause) == repr(AssertionError('Wrong'))
+    assert sub_cause.__cause__ is None
+    assert sub_cause.__traceback__ is not None
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 11), reason='This is the backport/legacy version used pre 3.11 only.')
+def test_validation_error_cause_contents_legacy():
+    from exceptiongroup import BaseExceptionGroup
+
+    enabled_config: CoreConfig = {'validation_error_cause': True}
+
+    def multi_raise_py_error(v: Any) -> Any:
+        try:
+            raise AssertionError('Wrong')
+        except AssertionError as e:
+            raise ValueError('Oh no!') from e
+
+    s2 = SchemaValidator(core_schema.no_info_plain_validator_function(multi_raise_py_error), config=enabled_config)
+    with pytest.raises(ValidationError) as exc_info:
+        s2.validate_python('anything')
+
+    cause_group = exc_info.value.__cause__
+    assert isinstance(cause_group, BaseExceptionGroup)
+    assert len(cause_group.exceptions) == 1
+
+    cause = cause_group.exceptions[0]
+    assert repr(cause).startswith("UserWarning('Pydantic: ")
+
+    assert cause.__cause__ is not None
+    cause = cause.__cause__
+    assert repr(cause) == repr(ValueError('Oh no!'))
+    assert cause.__traceback__ is not None
+
+    sub_cause = cause.__cause__
+    assert repr(sub_cause) == repr(AssertionError('Wrong'))
+    assert sub_cause.__cause__ is None
+    assert sub_cause.__traceback__ is not None
+
+    # Make sure a deep inner ValidationError(s) causing a validator failure doesn't cause any problems:
+    def outer_raise_py_error(v: Any) -> Any:
+        try:
+            s2.validate_python('anything')
+        except ValidationError as e:
+            raise ValueError('Sub val failure') from e
+
+    s3 = SchemaValidator(core_schema.no_info_plain_validator_function(outer_raise_py_error), config=enabled_config)
+    with pytest.raises(ValidationError) as exc_info:
+        s3.validate_python('anything')
+
+    assert isinstance(exc_info.value.__cause__, BaseExceptionGroup)
+    assert len(exc_info.value.__cause__.exceptions) == 1
+    cause = exc_info.value.__cause__.exceptions[0]
+    assert repr(cause).startswith("UserWarning('Pydantic: ")
+    assert cause.__cause__ is not None
+    cause = cause.__cause__
+    assert repr(cause) == repr(ValueError('Sub val failure'))
+    subcause = cause.__cause__
+    assert isinstance(subcause, ValidationError)
+
+    cause_group = subcause.__cause__
+    assert isinstance(cause_group, BaseExceptionGroup)
+    assert len(cause_group.exceptions) == 1
+
+    cause = cause_group.exceptions[0]
+    assert repr(cause).startswith("UserWarning('Pydantic: ")
+    assert cause.__cause__ is not None
+    cause = cause.__cause__
+    assert repr(cause) == repr(ValueError('Oh no!'))
+    assert cause.__traceback__ is not None
+
+    sub_cause = cause.__cause__
+    assert repr(sub_cause) == repr(AssertionError('Wrong'))
+    assert sub_cause.__cause__ is None
+    assert sub_cause.__traceback__ is not None
+
+
+class CauseResult(enum.Enum):
+    CAUSE = enum.auto()
+    NO_CAUSE = enum.auto()
+    IMPORT_ERROR = enum.auto()
+
+
+@pytest.mark.parametrize(
+    'desc,config,expected_result',
+    [  # Without the backport should still work after 3.10 as not needed:
+        (
+            'Enabled',
+            {'validation_error_cause': True},
+            CauseResult.CAUSE if sys.version_info >= (3, 11) else CauseResult.IMPORT_ERROR,
+        ),
+        ('Disabled specifically', {'validation_error_cause': False}, CauseResult.NO_CAUSE),
+        ('Disabled implicitly', {}, CauseResult.NO_CAUSE),
+    ],
+)
+def test_validation_error_cause_config_variants(desc: str, config: CoreConfig, expected_result: CauseResult):
+    # Simulate the package being missing:
+    with patch.dict('sys.modules', {'exceptiongroup': None}):
+
+        def singular_raise_py_error(v: Any) -> Any:
+            raise ValueError('Oh no!')
+
+        s = SchemaValidator(core_schema.no_info_plain_validator_function(singular_raise_py_error), config=config)
+
+        if expected_result is CauseResult.IMPORT_ERROR:
+            # Confirm error message contains "requires the exceptiongroup module" in the middle of the string:
+            with pytest.raises(ImportError, match='requires the exceptiongroup module'):
+                s.validate_python('anything')
+        elif expected_result is CauseResult.CAUSE:
+            with pytest.raises(ValidationError) as exc_info:
+                s.validate_python('anything')
+            assert exc_info.value.__cause__ is not None
+            assert hasattr(exc_info.value.__cause__, 'exceptions')
+            assert len(exc_info.value.__cause__.exceptions) == 1
+            assert repr(exc_info.value.__cause__.exceptions[0]) == repr(ValueError('Oh no!'))
+        elif expected_result is CauseResult.NO_CAUSE:
+            with pytest.raises(ValidationError) as exc_info:
+                s.validate_python('anything')
+            assert exc_info.value.__cause__ is None
+        else:
+            raise AssertionError('Unhandled result: {}'.format(expected_result))
+
+
+def test_validation_error_cause_traceback_preserved():
+    """Makes sure historic bug of traceback being lost is fixed."""
+
+    enabled_config: CoreConfig = {'validation_error_cause': True}
+
+    def singular_raise_py_error(v: Any) -> Any:
+        raise ValueError('Oh no!')
+
+    s1 = SchemaValidator(core_schema.no_info_plain_validator_function(singular_raise_py_error), config=enabled_config)
+    with pytest.raises(ValidationError) as exc_info:
+        s1.validate_python('anything')
+
+    base_errs = getattr(exc_info.value.__cause__, 'exceptions', [])
+    assert len(base_errs) == 1
+    base_err = base_errs[0]
+
+    # Get to the root error:
+    cause = base_err
+    while cause.__cause__ is not None:
+        cause = cause.__cause__
+
+    # Should still have a traceback:
+    assert cause.__traceback__ is not None
 
 
 class BadRepr:
@@ -611,7 +901,7 @@ def test_raise_validation_error():
     assert exc_info.value.errors(include_url=False) == [
         {'type': 'greater_than', 'loc': ('a', 2), 'msg': 'Input should be greater than 5', 'input': 4, 'ctx': {'gt': 5}}
     ]
-    with pytest.raises(TypeError, match='GreaterThan requires context: {gt: Number}'):
+    with pytest.raises(TypeError, match="GreaterThan: 'gt' required in context"):
         raise ValidationError.from_exception_data('Foobar', [{'type': 'greater_than', 'loc': ('a', 2), 'input': 4}])
 
 
@@ -667,6 +957,62 @@ def test_raise_validation_error_custom():
     ]
 
 
+@pytest.mark.parametrize(
+    'msg,result_msg', [('my custom error', 'my custom error'), ('my custom error {foo}', "my custom error {'bar': []}")]
+)
+def test_raise_validation_error_custom_nested_ctx(msg: str, result_msg: str):
+    ctx = {'foo': {'bar': []}}
+    custom_error = PydanticCustomError('my_error', msg, ctx)
+    with pytest.raises(ValidationError) as exc_info:
+        raise ValidationError.from_exception_data('Foobar', [{'type': custom_error, 'input': 'x'}])
+
+    expected_error_detail = {'type': 'my_error', 'loc': (), 'msg': result_msg, 'input': 'x', 'ctx': ctx}
+
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [expected_error_detail]
+    assert exc_info.value.json(include_url=False) == IsJson([{**expected_error_detail, 'loc': []}])
+
+
+def test_raise_validation_error_known_class_ctx():
+    custom_data = Foobar()
+    ctx = {'gt': 10, 'foo': {'bar': custom_data}}
+
+    with pytest.raises(ValidationError) as exc_info:
+        raise ValidationError.from_exception_data('MyTitle', [{'type': 'greater_than', 'input': 9, 'ctx': ctx}])
+
+    expected_error_detail = {
+        'type': 'greater_than',
+        'loc': (),
+        'msg': 'Input should be greater than 10',
+        'input': 9,
+        'ctx': ctx,
+    }
+
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [expected_error_detail]
+    assert exc_info.value.json(include_url=False) == IsJson(
+        [{**expected_error_detail, 'loc': [], 'ctx': {'gt': 10, 'foo': {'bar': str(custom_data)}}}]
+    )
+
+
+def test_raise_validation_error_custom_class_ctx():
+    custom_data = Foobar()
+    ctx = {'foo': {'bar': custom_data}}
+    custom_error = PydanticCustomError('my_error', 'my message', ctx)
+    assert custom_error.context == ctx
+
+    with pytest.raises(ValidationError) as exc_info:
+        raise ValidationError.from_exception_data('MyTitle', [{'type': custom_error, 'input': 'x'}])
+
+    expected_error_detail = {'type': 'my_error', 'loc': (), 'msg': 'my message', 'input': 'x', 'ctx': ctx}
+
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [expected_error_detail]
+    assert exc_info.value.json(include_url=False) == IsJson(
+        [{**expected_error_detail, 'loc': [], 'ctx': {'foo': {'bar': str(custom_data)}}}]
+    )
+
+
 def test_loc_with_dots(pydantic_version):
     v = SchemaValidator(
         core_schema.typed_dict_schema(
@@ -698,3 +1044,21 @@ def test_loc_with_dots(pydantic_version):
         "[type=int_parsing, input_value='x', input_type=str]\n"
         f'    For further information visit https://errors.pydantic.dev/{pydantic_version}/v/int_parsing'
     )
+
+
+def test_hide_input_in_error() -> None:
+    s = SchemaValidator({'type': 'int'})
+    with pytest.raises(ValidationError) as exc_info:
+        s.validate_python('definitely not an int')
+
+    for error in exc_info.value.errors(include_input=False):
+        assert 'input' not in error
+
+
+def test_hide_input_in_json() -> None:
+    s = SchemaValidator({'type': 'int'})
+    with pytest.raises(ValidationError) as exc_info:
+        s.validate_python('definitely not an int')
+
+    for error in exc_info.value.errors(include_input=False):
+        assert 'input' not in error

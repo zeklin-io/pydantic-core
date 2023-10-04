@@ -5,13 +5,13 @@ use pyo3::types::PyDict;
 use crate::definitions::DefinitionsBuilder;
 use crate::errors::ValResult;
 use crate::input::Input;
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
 use super::InputType;
-use super::{build_validator, BuildValidator, CombinedValidator, Definitions, Extra, Validator};
+use super::ValidationState;
+use super::{build_validator, BuildValidator, CombinedValidator, Validator};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct JsonOrPython {
     json: Box<CombinedValidator>,
     python: Box<CombinedValidator>,
@@ -51,35 +51,28 @@ impl BuildValidator for JsonOrPython {
 impl_py_gc_traverse!(JsonOrPython { json, python });
 
 impl Validator for JsonOrPython {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        definitions: &'data Definitions<CombinedValidator>,
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        match extra.mode {
-            InputType::Python => self.python.validate(py, input, extra, definitions, recursion_guard),
-            InputType::Json => self.json.validate(py, input, extra, definitions, recursion_guard),
+        match state.extra().input_type {
+            InputType::Python => self.python.validate(py, input, state),
+            _ => self.json.validate(py, input, state),
         }
     }
 
-    fn different_strict_behavior(
-        &self,
-        definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
-        self.json.different_strict_behavior(definitions, ultra_strict)
-            || self.python.different_strict_behavior(definitions, ultra_strict)
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
+        self.json.different_strict_behavior(ultra_strict) || self.python.different_strict_behavior(ultra_strict)
     }
 
     fn get_name(&self) -> &str {
         &self.name
     }
 
-    fn complete(&mut self, definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
-        self.json.complete(definitions)?;
-        self.python.complete(definitions)
+    fn complete(&self) -> PyResult<()> {
+        self.json.complete()?;
+        self.python.complete()
     }
 }

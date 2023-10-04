@@ -179,12 +179,12 @@ def test_float_repr():
     v = SchemaValidator({'type': 'float'})
     assert (
         plain_repr(v)
-        == 'SchemaValidator(title="float",validator=Float(FloatValidator{strict:false,allow_inf_nan:true}),definitions=[])'  # noqa: E501
+        == 'SchemaValidator(title="float",validator=Float(FloatValidator{strict:false,allow_inf_nan:true}),definitions=[])'
     )
     v = SchemaValidator({'type': 'float', 'strict': True})
     assert (
         plain_repr(v)
-        == 'SchemaValidator(title="float",validator=Float(FloatValidator{strict:true,allow_inf_nan:true}),definitions=[])'  # noqa: E501
+        == 'SchemaValidator(title="float",validator=Float(FloatValidator{strict:true,allow_inf_nan:true}),definitions=[])'
     )
     v = SchemaValidator({'type': 'float', 'multiple_of': 7})
     assert plain_repr(v).startswith('SchemaValidator(title="constrained-float",validator=ConstrainedFloat(')
@@ -215,7 +215,8 @@ def test_float_key(py_and_json: PyAndJson):
     assert v.validate_test({'1': 1, '2': 2}) == {1: 1, 2: 2}
     assert v.validate_test({'1.5': 1, '2.4': 2}) == {1.5: 1, 2.4: 2}
     with pytest.raises(ValidationError, match='Input should be a valid number'):
-        v.validate_test({'1.5': 1, '2.5': 2}, strict=True)
+        v.validate_python({'1.5': 1, '2.5': 2}, strict=True)
+    assert v.validate_json('{"1.5": 1, "2.5": 2}', strict=True) == {1.5: 1, 2.5: 2}
 
 
 @pytest.mark.parametrize(
@@ -359,3 +360,15 @@ def test_non_finite_constrained_float_values(input_value, allow_inf_nan, expecte
 def test_validate_scientific_notation_from_json(input_value, expected):
     v = SchemaValidator({'type': 'float'})
     assert v.validate_json(input_value) == expected
+
+
+def test_string_with_underscores() -> None:
+    v = SchemaValidator({'type': 'float'})
+    assert v.validate_python('1_000_000.0') == 1_000_000.0
+    assert v.validate_json('"1_000_000.0"') == 1_000_000.0
+
+    for edge_case in ('_1', '_1.0', '1__0', '1.1__1', '1_0.0_', '1._', '1_0__0.0'):
+        with pytest.raises(ValidationError):
+            v.validate_python(edge_case)
+        with pytest.raises(ValidationError):
+            v.validate_json(f'"{edge_case}"')

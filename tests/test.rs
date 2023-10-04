@@ -7,25 +7,46 @@ mod tests {
     #[test]
     fn test_build_schema_serializer() {
         Python::with_gil(|py| {
+            // 'type': 'typed-dict',
+            //     'fields': {
+            //         'root': {
+            //             'type': 'typed-dict-field',
+            //             'schema': {
+            //                 'type': 'definition-ref',
+            //                 'schema_ref': 'C-ref',
+            //             },
+            //         },
+            //     },
+            //     'ref': 'C-ref',
+            //     'serialization': {
+            //         'type': 'function-wrap',
+            //         'function': lambda: None,
+            //     },
             let code = r#"{
-                'type': 'typed-dict',
-                'fields': {
-                    'root': {
-                        'type': 'typed-dict-field',
-                        'schema': {
-                            'type': 'definition-ref',
-                            'schema_ref': 'C-ref',
+                'type': 'definitions',
+                'schema': {'type': 'definition-ref', 'schema_ref': 'C-ref'},
+                'definitions': [
+                    {
+                        'type': 'typed-dict',
+                        'fields': {
+                            'root': {
+                                'type': 'typed-dict-field',
+                                'schema': {
+                                    'type': 'definition-ref',
+                                    'schema_ref': 'C-ref',
+                                }
+                            },
+                        },
+                        'ref': 'C-ref',
+                        'serialization': {
+                            'type': 'function-wrap',
+                            'function': lambda: None,
                         },
                     },
-                },
-                'ref': 'C-ref',
-                'serialization': {
-                    'type': 'function-wrap',
-                    'function': lambda: None,
-                },
+                ]
             }"#;
             let schema: &PyDict = py.eval(code, None, None).unwrap().extract().unwrap();
-            SchemaSerializer::py_new(py, schema, None).unwrap();
+            SchemaSerializer::py_new(schema, None).unwrap();
         });
     }
 
@@ -56,7 +77,7 @@ a = A()
             py.run(code, None, Some(locals)).unwrap();
             let a: &PyAny = locals.get_item("a").unwrap().extract().unwrap();
             let schema: &PyDict = locals.get_item("schema").unwrap().extract().unwrap();
-            let serialized: Vec<u8> = SchemaSerializer::py_new(py, schema, None)
+            let serialized: Vec<u8> = SchemaSerializer::py_new(schema, None)
                 .unwrap()
                 .to_json(py, a, None, None, None, true, false, false, false, false, true, None)
                 .unwrap()

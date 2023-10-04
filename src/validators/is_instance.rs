@@ -6,10 +6,10 @@ use pyo3::types::{PyDict, PyType};
 use crate::build_tools::py_schema_err;
 use crate::errors::{ErrorType, ValError, ValResult};
 use crate::input::Input;
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::ValidationState;
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, Validator};
 
 #[derive(Debug, Clone)]
 pub struct IsInstanceValidator {
@@ -57,13 +57,11 @@ impl BuildValidator for IsInstanceValidator {
 impl_py_gc_traverse!(IsInstanceValidator { class });
 
 impl Validator for IsInstanceValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        _extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        _state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
         if !input.is_python() {
             return Err(ValError::InternalErr(PyNotImplementedError::new_err(
@@ -78,17 +76,14 @@ impl Validator for IsInstanceValidator {
             false => Err(ValError::new(
                 ErrorType::IsInstanceOf {
                     class: self.class_repr.clone(),
+                    context: None,
                 },
                 input,
             )),
         }
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        _ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, _ultra_strict: bool) -> bool {
         false
     }
 
@@ -96,7 +91,7 @@ impl Validator for IsInstanceValidator {
         &self.name
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 """
 Numerous benchmarks of specific functionality.
 """
+import decimal
 import json
 import platform
 import sys
@@ -14,7 +15,14 @@ import pytest
 from dirty_equals import IsStr
 
 import pydantic_core
-from pydantic_core import ArgsKwargs, PydanticCustomError, SchemaValidator, ValidationError, core_schema
+from pydantic_core import (
+    ArgsKwargs,
+    PydanticCustomError,
+    PydanticKnownError,
+    SchemaValidator,
+    ValidationError,
+    core_schema,
+)
 from pydantic_core import ValidationError as CoreValidationError
 
 skip_pypy_deep_stack = pytest.mark.skipif(
@@ -290,28 +298,28 @@ def test_definition_model_core(definition_model_data, benchmark):
         __slots__ = '__dict__', '__pydantic_fields_set__', '__pydantic_extra__', '__pydantic_private__'
 
     v = SchemaValidator(
-        {
-            'ref': 'Branch',
-            'type': 'model',
-            'cls': CoreBranch,
-            'schema': {
-                'type': 'model-fields',
-                'fields': {
-                    'width': {'type': 'model-field', 'schema': {'type': 'int'}},
-                    'branch': {
-                        'type': 'model-field',
-                        'schema': {
-                            'type': 'default',
-                            'schema': {
-                                'type': 'nullable',
-                                'schema': {'type': 'definition-ref', 'schema_ref': 'Branch'},
-                            },
-                            'default': None,
-                        },
-                    },
-                },
-            },
-        }
+        core_schema.definitions_schema(
+            core_schema.definition_reference_schema(schema_ref='Branch'),
+            [
+                core_schema.model_schema(
+                    CoreBranch,
+                    core_schema.model_fields_schema(
+                        {
+                            'width': core_schema.model_field(core_schema.int_schema()),
+                            'branch': core_schema.model_field(
+                                core_schema.with_default_schema(
+                                    core_schema.nullable_schema(
+                                        core_schema.definition_reference_schema(schema_ref='Branch')
+                                    ),
+                                    default=None,
+                                )
+                            ),
+                        }
+                    ),
+                    ref='Branch',
+                )
+            ],
+        )
     )
     benchmark(v.validate_python, definition_model_data)
 
@@ -783,7 +791,7 @@ def test_dont_raise_error(benchmark):
     def f(input_value, info):
         return input_value
 
-    v = SchemaValidator({'type': 'function-plain', 'function': {'type': 'general', 'function': f}})
+    v = SchemaValidator(core_schema.with_info_plain_validator_function(f))
 
     @benchmark
     def t():
@@ -795,7 +803,7 @@ def test_dont_raise_error_no_info(benchmark):
     def f(input_value):
         return input_value
 
-    v = SchemaValidator({'type': 'function-plain', 'function': {'type': 'no-info', 'function': f}})
+    v = SchemaValidator(core_schema.no_info_plain_validator_function(f))
 
     @benchmark
     def t():
@@ -807,7 +815,7 @@ def test_raise_error_value_error(benchmark):
     def f(input_value, info):
         raise ValueError('this is a custom error')
 
-    v = SchemaValidator({'type': 'function-plain', 'function': {'type': 'general', 'function': f}})
+    v = SchemaValidator(core_schema.with_info_plain_validator_function(f))
 
     @benchmark
     def t():
@@ -824,7 +832,7 @@ def test_raise_error_custom(benchmark):
     def f(input_value, info):
         raise PydanticCustomError('my_error', 'this is a custom error {foo}', {'foo': 'FOOBAR'})
 
-    v = SchemaValidator({'type': 'function-plain', 'function': {'type': 'general', 'function': f}})
+    v = SchemaValidator(core_schema.with_info_plain_validator_function(f))
 
     @benchmark
     def t():
@@ -867,7 +875,7 @@ def test_tuple_many_variable(benchmark):
 
 @pytest.mark.benchmark(group='tuple-many')
 def test_tuple_many_positional(benchmark):
-    v = SchemaValidator({'type': 'tuple-positional', 'items_schema': [], 'extra_schema': {'type': 'int'}})
+    v = SchemaValidator({'type': 'tuple-positional', 'items_schema': [], 'extras_schema': {'type': 'int'}})
     assert v.validate_python(list(range(10))) == tuple(range(10))
 
     benchmark(v.validate_python, list(range(10)))
@@ -919,10 +927,7 @@ def test_chain_list(benchmark):
     validator = SchemaValidator(
         {
             'type': 'chain',
-            'steps': [
-                {'type': 'str'},
-                {'type': 'function-plain', 'function': {'type': 'general', 'function': lambda v, info: Decimal(v)}},
-            ],
+            'steps': [{'type': 'str'}, core_schema.with_info_plain_validator_function(lambda v, info: Decimal(v))],
         }
     )
     assert validator.validate_python('42.42') == Decimal('42.42')
@@ -936,7 +941,7 @@ def test_chain_function(benchmark):
         {
             'type': 'function-after',
             'schema': {'type': 'str'},
-            'function': {'type': 'general', 'function': lambda v, info: Decimal(v)},
+            'function': {'type': 'with-info', 'function': lambda v, info: Decimal(v)},
         }
     )
     assert validator.validate_python('42.42') == Decimal('42.42')
@@ -951,8 +956,8 @@ def test_chain_two_functions(benchmark):
             'type': 'chain',
             'steps': [
                 {'type': 'str'},
-                {'type': 'function-plain', 'function': {'type': 'general', 'function': lambda v, info: Decimal(v)}},
-                {'type': 'function-plain', 'function': {'type': 'general', 'function': lambda v, info: v * 2}},
+                core_schema.with_info_plain_validator_function(lambda v, info: Decimal(v)),
+                core_schema.with_info_plain_validator_function(lambda v, info: v * 2),
             ],
         }
     )
@@ -969,9 +974,9 @@ def test_chain_nested_functions(benchmark):
             'schema': {
                 'type': 'function-after',
                 'schema': {'type': 'str'},
-                'function': {'type': 'general', 'function': lambda v, info: Decimal(v)},
+                'function': {'type': 'with-info', 'function': lambda v, info: Decimal(v)},
             },
-            'function': {'type': 'general', 'function': lambda v, info: v * 2},
+            'function': {'type': 'with-info', 'function': lambda v, info: v * 2},
         }
     )
     assert validator.validate_python('42.42') == Decimal('84.84')
@@ -994,7 +999,7 @@ def generator_gen_python(v, validator, info):
 
 @pytest.mark.benchmark(group='generator')
 def test_generator_python(benchmark):
-    schema = core_schema.general_wrap_validator_function(generator_gen_python, {'type': 'int'})
+    schema = core_schema.with_info_wrap_validator_function(generator_gen_python, {'type': 'int'})
     v = SchemaValidator(schema)
     input_value = tuple(range(100))
 
@@ -1293,7 +1298,7 @@ def test_tagged_union_int_keys_json(benchmark):
 @skip_wasm_deep_stack
 @pytest.mark.benchmark(group='field_function_validator')
 def test_field_function_validator(benchmark) -> None:
-    def f(v: int, info: core_schema.FieldValidationInfo) -> int:
+    def f(v: int, info: core_schema.ValidationInfo) -> int:
         assert info.field_name == 'x'
         return v + 1
 
@@ -1301,7 +1306,7 @@ def test_field_function_validator(benchmark) -> None:
     limit = pydantic_core._pydantic_core._recursion_limit - 3
 
     for _ in range(limit):
-        schema = core_schema.field_after_validator_function(f, 'x', schema)
+        schema = core_schema.with_info_after_validator_function(f, schema, field_name='x')
 
     schema = core_schema.typed_dict_schema({'x': core_schema.typed_dict_field(schema)})
 
@@ -1310,3 +1315,61 @@ def test_field_function_validator(benchmark) -> None:
     assert v.validate_python(payload) == {'x': limit}
 
     benchmark(v.validate_python, payload)
+
+
+class TestBenchmarkDecimal:
+    @pytest.fixture(scope='class')
+    def validator(self):
+        return SchemaValidator({'type': 'decimal'})
+
+    @pytest.fixture(scope='class')
+    def pydantic_validator(self):
+        Decimal = decimal.Decimal
+
+        def to_decimal(v: str) -> decimal.Decimal:
+            try:
+                return Decimal(v)
+            except decimal.DecimalException as e:
+                raise PydanticCustomError('decimal_parsing', 'Input should be a valid decimal') from e
+
+        primitive_schema = core_schema.union_schema(
+            [
+                # if it's an int keep it like that and pass it straight to Decimal
+                # but if it's not make it a string
+                # we don't use JSON -> float because parsing to any float will cause
+                # loss of precision
+                core_schema.int_schema(strict=True),
+                core_schema.str_schema(strict=True, strip_whitespace=True),
+                core_schema.no_info_plain_validator_function(str),
+            ]
+        )
+        json_schema = core_schema.no_info_after_validator_function(to_decimal, primitive_schema)
+        schema = core_schema.json_or_python_schema(
+            json_schema=json_schema,
+            python_schema=core_schema.lax_or_strict_schema(
+                lax_schema=core_schema.union_schema([core_schema.is_instance_schema(decimal.Decimal), json_schema]),
+                strict_schema=core_schema.is_instance_schema(decimal.Decimal),
+            ),
+            serialization=core_schema.to_string_ser_schema(when_used='json'),
+        )
+
+        def check_finite(value: decimal.Decimal) -> decimal.Decimal:
+            if not value.is_finite():
+                raise PydanticKnownError('finite_number')
+            return value
+
+        schema = core_schema.no_info_after_validator_function(check_finite, schema)
+
+        return SchemaValidator(schema)
+
+    @pytest.mark.benchmark(group='decimal from str')
+    def test_decimal_from_string_core(self, benchmark, validator):
+        benchmark(validator.validate_python, '123.456789')
+
+    @pytest.mark.benchmark(group='decimal from str')
+    def test_decimal_from_string_pyd(self, benchmark, pydantic_validator):
+        benchmark(pydantic_validator.validate_python, '123.456789')
+
+    @pytest.mark.benchmark(group='decimal from str')
+    def test_decimal_from_string_limit(self, benchmark):
+        benchmark(decimal.Decimal, '123.456789')

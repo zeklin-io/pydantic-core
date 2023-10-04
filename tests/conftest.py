@@ -13,7 +13,7 @@ import hypothesis
 import pytest
 from typing_extensions import Literal
 
-from pydantic_core import ArgsKwargs, SchemaValidator, ValidationError
+from pydantic_core import ArgsKwargs, SchemaValidator, ValidationError, validate_core_schema
 from pydantic_core.core_schema import CoreConfig
 
 __all__ = 'Err', 'PyAndJson', 'plain_repr', 'infinite_generator'
@@ -53,11 +53,14 @@ class PyAndJsonValidator:
     def __init__(
         self, schema, config: CoreConfig | None = None, *, validator_type: Literal['json', 'python'] | None = None
     ):
-        self.validator = SchemaValidator(schema, config)
+        self.validator = SchemaValidator(validate_core_schema(schema), config)
         self.validator_type = validator_type
 
     def validate_python(self, py_input, strict: bool | None = None, context: Any = None):
         return self.validator.validate_python(py_input, strict=strict, context=context)
+
+    def validate_json(self, json_str: str, strict: bool | None = None, context: Any = None):
+        return self.validator.validate_json(json_str, strict=strict, context=context)
 
     def validate_test(self, py_input, strict: bool | None = None, context: Any = None):
         if self.validator_type == 'json':
@@ -89,6 +92,25 @@ def py_and_json(request) -> PyAndJson:
         __init__ = functools.partialmethod(PyAndJsonValidator.__init__, validator_type=request.param)
 
     return ChosenPyAndJsonValidator
+
+
+class StrictModeType:
+    def __init__(self, schema: bool, extra: bool):
+        assert schema or extra
+        self.schema = schema
+        self.validator_args = {'strict': True} if extra else {}
+
+
+@pytest.fixture(
+    params=[
+        StrictModeType(schema=True, extra=False),
+        StrictModeType(schema=False, extra=True),
+        StrictModeType(schema=True, extra=True),
+    ],
+    ids=['strict-schema', 'strict-extra', 'strict-both'],
+)
+def strict_mode_type(request) -> StrictModeType:
+    return request.param
 
 
 @pytest.fixture

@@ -6,16 +6,16 @@ use ahash::AHashSet;
 
 use crate::build_tools::py_schema_err;
 use crate::build_tools::schema_or_config_same;
-use crate::errors::{ErrorType, ValError, ValLineError, ValResult};
+use crate::errors::{ErrorTypeDefaults, ValError, ValLineError, ValResult};
 use crate::input::{GenericArguments, Input};
 use crate::lookup_key::LookupKey;
 
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
-use super::{build_validator, BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::validation_state::ValidationState;
+use super::{build_validator, BuildValidator, CombinedValidator, DefinitionsBuilder, Validator};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Parameter {
     positional: bool,
     name: String,
@@ -24,7 +24,7 @@ struct Parameter {
     validator: CombinedValidator,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ArgumentsValidator {
     parameters: Vec<Parameter>,
     positional_params_count: usize,
@@ -161,13 +161,11 @@ impl_py_gc_traverse!(ArgumentsValidator {
 });
 
 impl Validator for ArgumentsValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        definitions: &'data Definitions<CombinedValidator>,
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
         let args = input.validate_args()?;
 
@@ -199,15 +197,13 @@ impl Validator for ArgumentsValidator {
                     match (pos_value, kw_value) {
                         (Some(_), Some((_, kw_value))) => {
                             errors.push(ValLineError::new_with_loc(
-                                ErrorType::MultipleArgumentValues,
+                                ErrorTypeDefaults::MultipleArgumentValues,
                                 kw_value,
                                 parameter.name.clone(),
                             ));
                         }
                         (Some(pos_value), None) => {
-                            match parameter
-                                .validator
-                                .validate(py, pos_value, extra, definitions, recursion_guard)
+                            match parameter.validator.validate(py, pos_value, state)
                             {
                                 Ok(value) => output_args.push(value),
                                 Err(ValError::LineErrors(line_errors)) => {
@@ -217,9 +213,7 @@ impl Validator for ArgumentsValidator {
                             }
                         }
                         (None, Some((lookup_path, kw_value))) => {
-                            match parameter
-                                .validator
-                                .validate(py, kw_value, extra, definitions, recursion_guard)
+                            match parameter.validator.validate(py, kw_value, state)
                             {
                                 Ok(value) => output_kwargs.set_item(parameter.kwarg_key.as_ref().unwrap(), value)?,
                                 Err(ValError::LineErrors(line_errors)) => {
@@ -231,7 +225,7 @@ impl Validator for ArgumentsValidator {
                             }
                         }
                         (None, None) => {
-                            if let Some(value) = parameter.validator.default_value(py, Some(parameter.name.as_str()), extra, definitions, recursion_guard)? {
+                            if let Some(value) = parameter.validator.default_value(py, Some(parameter.name.as_str()), state)? {
                                 if let Some(ref kwarg_key) = parameter.kwarg_key {
                                     output_kwargs.set_item(kwarg_key, value)?;
                                 } else {
@@ -239,9 +233,9 @@ impl Validator for ArgumentsValidator {
                                 }
                             } else if let Some(ref lookup_key) = parameter.kw_lookup_key {
                                 let error_type = if parameter.positional {
-                                    ErrorType::MissingArgument
+                                    ErrorTypeDefaults::MissingArgument
                                 } else {
-                                    ErrorType::MissingKeywordOnlyArgument
+                                    ErrorTypeDefaults::MissingKeywordOnlyArgument
                                 };
                                 errors.push(lookup_key.error(
                                     error_type,
@@ -250,7 +244,7 @@ impl Validator for ArgumentsValidator {
                                     &parameter.name,
                                 ));
                             } else {
-                                errors.push(ValLineError::new_with_loc(ErrorType::MissingPositionalOnlyArgument, input, index));
+                                errors.push(ValLineError::new_with_loc(ErrorTypeDefaults::MissingPositionalOnlyArgument, input, index));
                             };
                         }
                     }
@@ -261,7 +255,7 @@ impl Validator for ArgumentsValidator {
                     if len > self.positional_params_count {
                         if let Some(ref validator) = self.var_args_validator {
                             for (index, item) in $slice_macro!(args, self.positional_params_count, len).iter().enumerate() {
-                                match validator.validate(py, item, extra, definitions, recursion_guard) {
+                                match validator.validate(py, item, state) {
                                     Ok(value) => output_args.push(value),
                                     Err(ValError::LineErrors(line_errors)) => {
                                         errors.extend(
@@ -276,7 +270,7 @@ impl Validator for ArgumentsValidator {
                         } else {
                             for (index, item) in $slice_macro!(args, self.positional_params_count, len).iter().enumerate() {
                                 errors.push(ValLineError::new_with_loc(
-                                    ErrorType::UnexpectedPositionalArgument,
+                                    ErrorTypeDefaults::UnexpectedPositionalArgument,
                                     item,
                                     index + self.positional_params_count,
                                 ));
@@ -294,7 +288,7 @@ impl Validator for ArgumentsValidator {
                                     for err in line_errors {
                                         errors.push(
                                             err.with_outer_location(raw_key.as_loc_item())
-                                                .with_type(ErrorType::InvalidKey),
+                                                .with_type(ErrorTypeDefaults::InvalidKey),
                                         );
                                     }
                                     continue;
@@ -303,7 +297,7 @@ impl Validator for ArgumentsValidator {
                             };
                             if !used_kwargs.contains(either_str.as_cow()?.as_ref()) {
                                 match self.var_kwargs_validator {
-                                    Some(ref validator) => match validator.validate(py, value, extra, definitions, recursion_guard) {
+                                    Some(ref validator) => match validator.validate(py, value, state) {
                                         Ok(value) => output_kwargs.set_item(either_str.as_py_string(py), value)?,
                                         Err(ValError::LineErrors(line_errors)) => {
                                             for err in line_errors {
@@ -314,7 +308,7 @@ impl Validator for ArgumentsValidator {
                                     },
                                     None => {
                                         errors.push(ValLineError::new_with_loc(
-                                            ErrorType::UnexpectedKeywordArgument,
+                                            ErrorTypeDefaults::UnexpectedKeywordArgument,
                                             value,
                                             raw_key.as_loc_item(),
                                         ));
@@ -329,6 +323,7 @@ impl Validator for ArgumentsValidator {
         match args {
             GenericArguments::Py(a) => process!(a, py_get_dict_item, py_get, py_slice),
             GenericArguments::Json(a) => process!(a, json_get, json_get, json_slice),
+            GenericArguments::StringMapping(_) => unimplemented!(),
         }
         if !errors.is_empty() {
             Err(ValError::LineErrors(errors))
@@ -337,29 +332,25 @@ impl Validator for ArgumentsValidator {
         }
     }
 
-    fn different_strict_behavior(
-        &self,
-        definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         self.parameters
             .iter()
-            .any(|p| p.validator.different_strict_behavior(definitions, ultra_strict))
+            .any(|p| p.validator.different_strict_behavior(ultra_strict))
     }
 
     fn get_name(&self) -> &str {
         Self::EXPECTED_TYPE
     }
 
-    fn complete(&mut self, definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         self.parameters
-            .iter_mut()
-            .try_for_each(|parameter| parameter.validator.complete(definitions))?;
-        if let Some(v) = &mut self.var_args_validator {
-            v.complete(definitions)?;
+            .iter()
+            .try_for_each(|parameter| parameter.validator.complete())?;
+        if let Some(v) = &self.var_args_validator {
+            v.complete()?;
         }
-        if let Some(v) = &mut self.var_kwargs_validator {
-            v.complete(definitions)?;
+        if let Some(v) = &self.var_kwargs_validator {
+            v.complete()?;
         };
         Ok(())
     }

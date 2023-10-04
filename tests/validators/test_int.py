@@ -51,14 +51,16 @@ def test_int_py_and_json(py_and_json: PyAndJson, input_value, expected):
     else:
         output = v.validate_test(input_value)
         assert output == expected
-        assert isinstance(output, int)
+        assert type(output) == int
 
 
 @pytest.mark.parametrize(
     'input_value,expected',
     [
         (Decimal('1'), 1),
+        (Decimal('1' + '0' * 1_000), int('1' + '0' * 1_000)),  # a large decimal
         (Decimal('1.0'), 1),
+        (1.0, 1),
         (i64_max, i64_max),
         (str(i64_max), i64_max),
         (str(i64_max * 2), i64_max * 2),
@@ -66,6 +68,14 @@ def test_int_py_and_json(py_and_json: PyAndJson, input_value, expected):
         (-i64_max + 1, -i64_max + 1),
         (i64_max * 2, i64_max * 2),
         (-i64_max * 2, -i64_max * 2),
+        pytest.param(
+            1.00000000001,
+            Err(
+                'Input should be a valid integer, got a number with a fractional part '
+                '[type=int_from_float, input_value=1.00000000001, input_type=float]'
+            ),
+            id='decimal-remainder',
+        ),
         pytest.param(
             Decimal('1.001'),
             Err(
@@ -392,4 +402,60 @@ def test_int_key(py_and_json: PyAndJson):
     v = py_and_json({'type': 'dict', 'keys_schema': {'type': 'int'}, 'values_schema': {'type': 'int'}})
     assert v.validate_test({'1': 1, '2': 2}) == {1: 1, 2: 2}
     with pytest.raises(ValidationError, match='Input should be a valid integer'):
-        v.validate_test({'1': 1, '2': 2}, strict=True)
+        v.validate_python({'1': 1, '2': 2}, strict=True)
+    assert v.validate_json('{"1": 1, "2": 2}', strict=True) == {1: 1, 2: 2}
+
+
+def test_string_as_int_with_underscores() -> None:
+    v = SchemaValidator({'type': 'int'})
+    assert v.validate_python('1_000_000') == 1_000_000
+    assert v.validate_json('"1_000_000"') == 1_000_000
+
+    for edge_case in ('_1', '1__0', '1_0_', '1_0__0'):
+        with pytest.raises(ValidationError):
+            v.validate_python(edge_case)
+        with pytest.raises(ValidationError):
+            v.validate_json(f'"{edge_case}"')
+
+
+class IntSubclass(int):
+    pass
+
+
+def test_int_subclass() -> None:
+    v = SchemaValidator({'type': 'int'})
+    v_lax = v.validate_python(IntSubclass(1))
+    assert v_lax == 1
+    assert type(v_lax) == int
+    v_strict = v.validate_python(IntSubclass(1), strict=True)
+    assert v_strict == 1
+    assert type(v_strict) == int
+
+    assert v.validate_python(IntSubclass(1136885225876639845)) == 1136885225876639845
+    assert v.validate_python(IntSubclass(i64_max + 7)) == i64_max + 7
+    assert v.validate_python(IntSubclass(1136885225876639845), strict=True) == 1136885225876639845
+    assert v.validate_python(IntSubclass(i64_max + 7), strict=True) == i64_max + 7
+
+
+def test_int_subclass_constraint() -> None:
+    v = SchemaValidator({'type': 'int', 'gt': 0})
+    v_lax = v.validate_python(IntSubclass(1))
+    assert v_lax == 1
+    assert type(v_lax) == int
+    v_strict = v.validate_python(IntSubclass(1), strict=True)
+    assert v_strict == 1
+    assert type(v_strict) == int
+
+    with pytest.raises(ValidationError, match='Input should be greater than 0'):
+        v.validate_python(IntSubclass(0))
+
+
+class FloatSubclass(float):
+    pass
+
+
+def test_float_subclass() -> None:
+    v = SchemaValidator({'type': 'int'})
+    v_lax = v.validate_python(FloatSubclass(1))
+    assert v_lax == 1
+    assert type(v_lax) == int

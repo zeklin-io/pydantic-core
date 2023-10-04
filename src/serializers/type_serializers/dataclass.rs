@@ -55,7 +55,7 @@ impl BuildSerializer for DataclassArgsBuilder {
 
         let computed_fields = ComputedFields::new(schema, config, definitions)?;
 
-        Ok(GeneralFieldsSerializer::new(fields, fields_mode, computed_fields).into())
+        Ok(GeneralFieldsSerializer::new(fields, fields_mode, None, computed_fields).into())
     }
 }
 
@@ -146,7 +146,7 @@ impl TypeSerializer for DataclassSerializer {
 
     fn json_key<'py>(&self, key: &'py PyAny, extra: &Extra) -> PyResult<Cow<'py, str>> {
         if self.allow_value(key, extra)? {
-            infer_json_key_known(&ObType::Dataclass, key, extra)
+            infer_json_key_known(ObType::Dataclass, key, extra)
         } else {
             extra.warnings.on_fallback_py(&self.name, key, extra)?;
             infer_json_key(key, extra)

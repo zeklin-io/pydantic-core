@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-20.04
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: install rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -74,11 +74,12 @@ jobs:
           - 'pypy3.7'
           - 'pypy3.8'
           - 'pypy3.9'
+          - 'pypy3.10'
 
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: install rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -115,7 +116,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: install rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -152,10 +153,10 @@ jobs:
       matrix:
         python-version:
           - '3.11'
-          - 'pypy3.9'
+          - 'pypy3.10'
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: set up python
         uses: actions/setup-python@v4
         with:
@@ -177,14 +178,15 @@ jobs:
 
   test-pydantic-integration:
     runs-on: ubuntu-latest
+    continue-on-error: true
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           repository: pydantic/pydantic
           path: pydantic
 
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           path: pydantic-core
 
@@ -205,7 +207,7 @@ jobs:
         run: |
           pip install pdm maturin
           pdm venv create --with-pip
-          pdm install -G testing
+          pdm install -G testing -G email
           pdm run pip install maturin
           pdm run bash -c 'cd ../pydantic-core && make build-dev'
         working-directory: pydantic
@@ -219,7 +221,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: install rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -267,7 +269,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: install rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -286,7 +288,7 @@ jobs:
   build-wasm-emscripten:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: set up python
         id: setup-python
@@ -336,20 +338,20 @@ jobs:
   # https://github.com/marketplace/actions/alls-green#why used for branch protection checks
   check:
     if: always()
-    needs: [coverage, test-python, test-os, test-debug, test-pydantic-integration, lint, bench, build-wasm-emscripten]
+    needs: [coverage, test-python, test-os, test-debug, lint, bench, build-wasm-emscripten]
     runs-on: ubuntu-latest
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-failures: coverage, test-pydantic-integration
+          allowed-failures: coverage
 
   build-sdist:
     name: build sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
@@ -381,22 +383,23 @@ jobs:
             target: i686
             python-architecture: x86
             interpreter: 3.7 3.8 3.9 3.10 3.11 3.12
+          - os: windows
+            ls: dir
+            target: aarch64
+            interpreter: 3.11 3.12
           - os: macos
             target: aarch64
-            interpreter: 3.7 3.8 3.9 3.10 3.11 3.12
+            interpreter: 3.7 3.8 3.9 3.10 3.11 3.12 pypy3.8 pypy3.9 pypy3.10
           - os: ubuntu
             platform: linux
             target: i686
-          # GCC 4.8.5 in manylinux2014 container doesn't support c11 atomic
-          # we use manylinux_2_24 container for aarch64 and armv7 targets instead,
           - os: ubuntu
             platform: linux
             target: aarch64
-            container: messense/manylinux_2_24-cross:aarch64
+
           - os: ubuntu
             platform: linux
             target: armv7
-            container: messense/manylinux_2_24-cross:armv7
             interpreter: 3.7 3.8 3.9 3.10 3.11 3.12
           # musllinux
           - os: ubuntu
@@ -410,12 +413,10 @@ jobs:
           - os: ubuntu
             platform: linux
             target: ppc64le
-            container: messense/manylinux_2_24-cross:ppc64le
             interpreter: 3.7 3.8 3.9 3.10 3.11 3.12
           - os: ubuntu
             platform: linux
             target: s390x
-            container: messense/manylinux_2_24-cross:s390x
             interpreter: 3.7 3.8 3.9 3.10 3.11 3.12
         exclude:
           # Optimized PGO builds for x86_64 manylinux and windows follow a different matrix,
@@ -431,7 +432,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: set up python
         uses: actions/setup-python@v4
@@ -450,7 +451,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           container: ${{ matrix.container }}
-          args: --release --out dist --interpreter ${{ matrix.interpreter || '3.7 3.8 3.9 3.10 3.11 3.12 pypy3.7 pypy3.8 pypy3.9 pypy3.10' }}
+          args: --release --out dist --interpreter ${{ matrix.interpreter || '3.7 3.8 3.9 3.10 3.11 3.12 pypy3.7 pypy3.8 pypy3.9 pypy3.10' }} ${{ matrix.extra-build-args }}
           rust-toolchain: stable
           docker-options: -e CI
 
@@ -484,7 +485,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: set up python
         uses: actions/setup-python@v4
@@ -558,7 +559,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: get dist artifacts
         uses: actions/download-artifact@v3
@@ -598,7 +599,7 @@ jobs:
             distro: alpine_latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: get dist artifacts
         uses: actions/download-artifact@v3
@@ -606,7 +607,7 @@ jobs:
           name: pypi_files
           path: dist
 
-      - uses: uraimo/run-on-arch-action@v2.5.0
+      - uses: uraimo/run-on-arch-action@v2.5.1
         name: install & test
         with:
           arch: ${{ matrix.target }}
@@ -645,7 +646,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: set up python
         uses: actions/setup-python@v4
@@ -669,7 +670,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: set up python
         uses: actions/setup-python@v4

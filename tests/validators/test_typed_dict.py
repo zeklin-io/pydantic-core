@@ -8,7 +8,7 @@ from typing import Any, Dict, Mapping, Union
 import pytest
 from dirty_equals import FunctionCheck
 
-from pydantic_core import CoreConfig, SchemaError, SchemaValidator, ValidationError, core_schema
+from pydantic_core import CoreConfig, SchemaError, SchemaValidator, ValidationError, core_schema, validate_core_schema
 
 from ..conftest import Err, PyAndJson
 
@@ -186,15 +186,15 @@ def test_forbid_extra():
 
 
 def test_allow_extra_invalid():
-    with pytest.raises(SchemaError, match='extra_validator can only be used if extra_behavior=allow'):
+    with pytest.raises(SchemaError, match='extras_schema can only be used if extra_behavior=allow'):
         SchemaValidator(
-            {'type': 'typed-dict', 'fields': {}, 'extra_validator': {'type': 'int'}, 'extra_behavior': 'ignore'}
+            {'type': 'typed-dict', 'fields': {}, 'extras_schema': {'type': 'int'}, 'extra_behavior': 'ignore'}
         )
 
 
 def test_allow_extra_wrong():
     with pytest.raises(SchemaError, match="Input should be 'allow', 'forbid' or 'ignore'"):
-        SchemaValidator({'type': 'typed-dict', 'fields': {}, 'config': {'extra_fields_behavior': 'wrong'}})
+        validate_core_schema({'type': 'typed-dict', 'fields': {}, 'config': {'extra_fields_behavior': 'wrong'}})
 
 
 def test_str_config():
@@ -235,7 +235,7 @@ def test_json_error():
 
 def test_missing_schema_key():
     with pytest.raises(SchemaError, match='typed-dict.fields.x.schema\n  Field required'):
-        SchemaValidator({'type': 'typed-dict', 'fields': {'x': {'type': 'str'}}})
+        validate_core_schema({'type': 'typed-dict', 'fields': {'x': {'type': 'str'}}})
 
 
 def test_fields_required_by_default():
@@ -629,10 +629,12 @@ def test_paths_allow_by_name(py_and_json: PyAndJson, input_value):
 def test_alias_build_error(alias_schema, error):
     with pytest.raises(SchemaError, match=error):
         SchemaValidator(
-            {
-                'type': 'typed-dict',
-                'fields': {'field_a': {'type': 'typed-dict-field', 'schema': {'type': 'int'}, **alias_schema}},
-            }
+            validate_core_schema(
+                {
+                    'type': 'typed-dict',
+                    'fields': {'field_a': {'type': 'typed-dict-field', 'schema': {'type': 'int'}, **alias_schema}},
+                }
+            )
         )
 
 
@@ -899,7 +901,7 @@ def test_bad_default_factory(default_factory, error_message):
 class TestOnError:
     def test_on_error_bad_name(self):
         with pytest.raises(SchemaError, match="Input should be 'raise', 'omit' or 'default'"):
-            SchemaValidator(
+            validate_core_schema(
                 {
                     'type': 'typed-dict',
                     'fields': {
@@ -1064,7 +1066,7 @@ class TestOnError:
                             'on_error': 'raise',
                             'schema': {
                                 'type': 'function-wrap',
-                                'function': {'type': 'general', 'function': wrap_function},
+                                'function': {'type': 'with-info', 'function': wrap_function},
                                 'schema': {'type': 'str'},
                             },
                         },
@@ -1089,21 +1091,21 @@ class TestOnError:
     ],
 )
 @pytest.mark.parametrize(
-    'extra_validator_kw, expected_extra_value',
-    [({}, '123'), ({'extra_validator': None}, '123'), ({'extra_validator': core_schema.int_schema()}, 123)],
-    ids=['extra_validator=unset', 'extra_validator=None', 'extra_validator=int'],
+    'extras_schema_kw, expected_extra_value',
+    [({}, '123'), ({'extras_schema': None}, '123'), ({'extras_schema': core_schema.int_schema()}, 123)],
+    ids=['extras_schema=unset', 'extras_schema=None', 'extras_schema=int'],
 )
 def test_extra_behavior_allow(
     config: Union[core_schema.CoreConfig, None],
     schema_extra_behavior_kw: Dict[str, Any],
-    extra_validator_kw: Dict[str, Any],
+    extras_schema_kw: Dict[str, Any],
     expected_extra_value: Any,
 ):
     v = SchemaValidator(
         core_schema.typed_dict_schema(
             {'f': core_schema.typed_dict_field(core_schema.str_schema())},
             **schema_extra_behavior_kw,
-            **extra_validator_kw,
+            **extras_schema_kw,
             config=config,
         )
     )
@@ -1171,9 +1173,9 @@ def test_leak_typed_dict():
         def validate(v, info):
             return v
 
-        schema = core_schema.general_plain_validator_function(validate)
+        schema = core_schema.with_info_plain_validator_function(validate)
         schema = core_schema.typed_dict_schema(
-            {'f': core_schema.typed_dict_field(schema)}, extra_behavior='allow', extra_validator=schema
+            {'f': core_schema.typed_dict_field(schema)}, extra_behavior='allow', extras_schema=schema
         )
 
         # If any of the Rust validators don't implement traversal properly,

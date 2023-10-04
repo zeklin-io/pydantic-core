@@ -7,14 +7,13 @@ use pyo3::types::{PyDict, PyType};
 use uuid::Uuid;
 
 use crate::build_tools::is_strict;
-use crate::errors::{ErrorType, ValError, ValResult};
+use crate::errors::{ErrorType, ErrorTypeDefaults, ValError, ValResult};
 use crate::input::Input;
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
 use super::model::create_class;
 use super::model::force_setattr;
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
 const UUID_INT: &str = "int";
 const UUID_IS_SAFE: &str = "is_safe";
@@ -60,7 +59,7 @@ impl From<u8> for Version {
 #[derive(Debug, Clone)]
 pub struct UuidValidator {
     strict: bool,
-    version: Option<Version>,
+    version: Option<usize>,
 }
 
 impl BuildValidator for UuidValidator {
@@ -72,10 +71,11 @@ impl BuildValidator for UuidValidator {
         _definitions: &mut DefinitionsBuilder<CombinedValidator>,
     ) -> PyResult<CombinedValidator> {
         let py = schema.py();
+        // Note(lig): let's keep this conversion through the Version enum just for the sake of validation
         let version = schema.get_as::<u8>(intern!(py, "version"))?.map(Version::from);
         Ok(Self {
             strict: is_strict(schema, config)?,
-            version,
+            version: version.map(usize::from),
         }
         .into())
     }
@@ -84,28 +84,35 @@ impl BuildValidator for UuidValidator {
 impl_py_gc_traverse!(UuidValidator {});
 
 impl Validator for UuidValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
         let class = get_uuid_type(py)?;
         if let Some(py_input) = input.input_is_instance(class) {
             if let Some(expected_version) = self.version {
-                let py_input_version: usize = py_input.getattr(intern!(py, "version"))?.extract()?;
-                let expected_version = usize::from(expected_version);
-                if expected_version != py_input_version {
-                    return Err(ValError::new(ErrorType::UuidVersion { expected_version }, input));
+                let py_input_version: Option<usize> = py_input.getattr(intern!(py, "version"))?.extract()?;
+                if !match py_input_version {
+                    Some(py_input_version) => py_input_version == expected_version,
+                    None => false,
+                } {
+                    return Err(ValError::new(
+                        ErrorType::UuidVersion {
+                            expected_version,
+                            context: None,
+                        },
+                        input,
+                    ));
                 }
             }
             Ok(py_input.to_object(py))
-        } else if extra.strict.unwrap_or(self.strict) && input.is_python() {
+        } else if state.strict_or(self.strict) && input.is_python() {
             Err(ValError::new(
                 ErrorType::IsInstanceOf {
                     class: class.name().unwrap_or("UUID").to_string(),
+                    context: None,
                 },
                 input,
             ))
@@ -115,11 +122,7 @@ impl Validator for UuidValidator {
         }
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         !ultra_strict
     }
 
@@ -127,7 +130,7 @@ impl Validator for UuidValidator {
         Self::EXPECTED_TYPE
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }
@@ -138,13 +141,20 @@ impl UuidValidator {
             Some(either_string) => {
                 let cow = either_string.as_cow()?;
                 let uuid_str = cow.as_ref();
-                Uuid::parse_str(uuid_str)
-                    .map_err(|e| ValError::new(ErrorType::UuidParsing { error: e.to_string() }, input))?
+                Uuid::parse_str(uuid_str).map_err(|e| {
+                    ValError::new(
+                        ErrorType::UuidParsing {
+                            error: e.to_string(),
+                            context: None,
+                        },
+                        input,
+                    )
+                })?
             }
             None => {
                 let either_bytes = input
                     .validate_bytes(true)
-                    .map_err(|_| ValError::new(ErrorType::UuidType, input))?;
+                    .map_err(|_| ValError::new(ErrorTypeDefaults::UuidType, input))?;
                 let bytes_slice = either_bytes.as_slice();
                 'parse: {
                     // Try parsing as utf8, but don't care if it fails
@@ -153,17 +163,29 @@ impl UuidValidator {
                             break 'parse uuid;
                         }
                     }
-                    Uuid::from_slice(bytes_slice)
-                        .map_err(|e| ValError::new(ErrorType::UuidParsing { error: e.to_string() }, input))?
+                    Uuid::from_slice(bytes_slice).map_err(|e| {
+                        ValError::new(
+                            ErrorType::UuidParsing {
+                                error: e.to_string(),
+                                context: None,
+                            },
+                            input,
+                        )
+                    })?
                 }
             }
         };
 
         if let Some(expected_version) = self.version {
             let v1 = uuid.get_version_num();
-            let expected_version = usize::from(expected_version);
             if v1 != expected_version {
-                return Err(ValError::new(ErrorType::UuidVersion { expected_version }, input));
+                return Err(ValError::new(
+                    ErrorType::UuidVersion {
+                        expected_version,
+                        context: None,
+                    },
+                    input,
+                ));
             }
         };
         Ok(uuid)

@@ -23,6 +23,10 @@ def foo(bar: str) -> None:
     ...
 
 
+def validator_deprecated(value: Any, info: core_schema.FieldValidationInfo) -> None:
+    ...
+
+
 def validator(value: Any, info: core_schema.ValidationInfo) -> None:
     ...
 
@@ -111,29 +115,35 @@ def test_schema_typing() -> None:
     SchemaValidator(schema)
     schema: CoreSchema = {
         'type': 'function-wrap',
-        'function': {'type': 'general', 'function': wrap_validator},
+        'function': {'type': 'with-info', 'function': wrap_validator, 'field_name': 'foobar'},
         'schema': {'type': 'str'},
     }
     SchemaValidator(schema)
-    schema: CoreSchema = {'type': 'function-plain', 'function': {'type': 'general', 'function': validator}}
+    schema: CoreSchema = core_schema.with_info_plain_validator_function(validator)
     SchemaValidator(schema)
     schema: CoreSchema = {
-        'ref': 'Branch',
-        'type': 'typed-dict',
-        'fields': {
-            'name': {'type': 'typed-dict-field', 'schema': {'type': 'str'}},
-            'sub_branch': {
-                'type': 'typed-dict-field',
-                'schema': {
-                    'type': 'default',
-                    'schema': {
-                        'type': 'union',
-                        'choices': [{'type': 'none'}, {'type': 'definition-ref', 'schema_ref': 'Branch'}],
+        'type': 'definitions',
+        'schema': {'type': 'definition-ref', 'schema_ref': 'Branch'},
+        'definitions': [
+            {
+                'type': 'typed-dict',
+                'fields': {
+                    'name': {'type': 'typed-dict-field', 'schema': {'type': 'str'}},
+                    'sub_branch': {
+                        'type': 'typed-dict-field',
+                        'schema': {
+                            'type': 'default',
+                            'schema': {
+                                'type': 'nullable',
+                                'schema': {'type': 'definition-ref', 'schema_ref': 'Branch'},
+                            },
+                            'default': None,
+                        },
                     },
-                    'default': None,
                 },
-            },
-        },
+                'ref': 'Branch',
+            }
+        ],
     }
     SchemaValidator(schema)
     schema: CoreSchema = {'type': 'date', 'le': date.today()}
@@ -183,7 +193,7 @@ def test_correct_function_signature() -> None:
     def my_validator(value: Any, info: Any) -> str:
         return str(value)
 
-    v = SchemaValidator(core_schema.general_plain_validator_function(my_validator))
+    v = SchemaValidator(core_schema.with_info_plain_validator_function(my_validator))
     assert v.validate_python(1) == '1'
 
 
@@ -191,7 +201,7 @@ def test_wrong_function_signature() -> None:
     def wrong_validator(value: Any) -> Any:
         return value
 
-    v = SchemaValidator(core_schema.general_plain_validator_function(wrong_validator))  # type: ignore
+    v = SchemaValidator(core_schema.with_info_plain_validator_function(wrong_validator))  # type: ignore
 
     # use this instead of pytest.raises since pyright complains about input when pytest isn't installed
     try:

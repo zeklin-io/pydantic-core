@@ -5,9 +5,14 @@ from typing import Any, Dict
 
 import pytest
 
-from pydantic_core import SchemaError, SchemaValidator, ValidationError
+from pydantic_core import SchemaError, SchemaValidator, ValidationError, validate_core_schema
 
 from ..conftest import Err, PyAndJson
+
+try:
+    import pandas
+except ImportError:
+    pandas = None
 
 
 @pytest.mark.parametrize(
@@ -131,25 +136,20 @@ def test_timedelta_strict_json(input_value, expected):
         ({}, 'P0Y0M3D2WT1H2M3S', timedelta(days=3, weeks=2, hours=1, minutes=2, seconds=3)),
         ({'le': timedelta(days=3)}, 'P2DT1H', timedelta(days=2, hours=1)),
         ({'le': timedelta(days=3)}, 'P3DT0H', timedelta(days=3)),
-        ({'le': timedelta(days=3)}, 'P3DT1H', Err('Input should be less than or equal to datetime.timedelta(days=3)')),
+        ({'le': timedelta(days=3)}, 'P3DT1H', Err('Input should be less than or equal to 3 days')),
         ({'lt': timedelta(days=3)}, 'P2DT1H', timedelta(days=2, hours=1)),
-        ({'lt': timedelta(days=3)}, 'P3DT1H', Err('Input should be less than datetime.timedelta(days=3)')),
+        ({'lt': timedelta(days=3)}, 'P3DT1H', Err('Input should be less than 3 days')),
         ({'ge': timedelta(days=3)}, 'P3DT1H', timedelta(days=3, hours=1)),
         ({'ge': timedelta(days=3)}, 'P3D', timedelta(days=3)),
-        (
-            {'ge': timedelta(days=3)},
-            'P2DT1H',
-            Err('Input should be greater than or equal to datetime.timedelta(days=3)'),
-        ),
+        ({'ge': timedelta(days=3)}, 'P2DT1H', Err('Input should be greater than or equal to 3 days')),
         ({'gt': timedelta(days=3)}, 'P3DT1H', timedelta(days=3, hours=1)),
-        ({'gt': 'P3D'}, 'P2DT1H', Err('Input should be greater than datetime.timedelta(days=3)')),
         ({'le': timedelta(seconds=-86400.123)}, '-PT86400.123S', timedelta(seconds=-86400.123)),
         ({'le': timedelta(seconds=-86400.123)}, '-PT86400.124S', timedelta(seconds=-86400.124)),
         (
             {'le': timedelta(seconds=-86400.123)},
             '-PT86400.122S',
             Err(
-                'Input should be less than or equal to datetime.timedelta(days=-2, seconds=86399, microseconds=877000) [type=less_than_equal'  # noqa: E501
+                'Input should be less than or equal to -2 days and 23 hours and 59 minutes and 59 seconds and 877000 microseconds [type=less_than_equal'
             ),
         ),
         ({'gt': timedelta(seconds=-86400.123)}, timedelta(seconds=-86400.122), timedelta(seconds=-86400.122)),
@@ -158,8 +158,22 @@ def test_timedelta_strict_json(input_value, expected):
             {'gt': timedelta(seconds=-86400.123)},
             '-PT86400.124S',
             Err(
-                'Input should be greater than datetime.timedelta(days=-2, seconds=86399, microseconds=877000) [type=greater_than'  # noqa: E501
+                'Input should be greater than -2 days and 23 hours and 59 minutes and 59 seconds and 877000 microseconds [type=greater_than'
             ),
+        ),
+        (
+            {'gt': timedelta(hours=1, minutes=30)},
+            'PT180S',
+            Err('Input should be greater than 1 hour and 30 minutes [type=greater_than'),
+        ),
+        ({'gt': timedelta()}, '-P0DT0.1S', Err('Input should be greater than 0 seconds [type=greater_than')),
+        ({'gt': timedelta()}, 'P0DT0.0S', Err('Input should be greater than 0 seconds [type=greater_than')),
+        ({'ge': timedelta()}, 'P0DT0.0S', timedelta()),
+        ({'lt': timedelta()}, '-PT0S', timedelta()),
+        (
+            {'lt': timedelta(days=740, weeks=1, hours=48, minutes=60, seconds=61, microseconds=100000)},
+            'P2Y1W10DT48H60M61.100000S',
+            Err('Input should be less than 749 days and 1 hour and 1 minute and 1 second and 100000 microseconds'),
         ),
     ],
     ids=repr,
@@ -182,10 +196,10 @@ def test_timedelta_kwargs_strict():
 
 def test_invalid_constraint():
     with pytest.raises(SchemaError, match='timedelta.gt\n  Input should be a valid timedelta, invalid digit in'):
-        SchemaValidator({'type': 'timedelta', 'gt': 'foobar'})
+        validate_core_schema({'type': 'timedelta', 'gt': 'foobar'})
 
     with pytest.raises(SchemaError, match='timedelta.le\n  Input should be a valid timedelta, invalid digit in'):
-        SchemaValidator({'type': 'timedelta', 'le': 'foobar'})
+        validate_core_schema({'type': 'timedelta', 'le': 'foobar'})
 
 
 def test_dict_py():
@@ -259,3 +273,19 @@ def test_large_value():
     assert v.validate_python(f'{999_999_999}days, 12:34') == timedelta(days=999_999_999, hours=12, minutes=34)
     with pytest.raises(ValidationError, match='should be a valid timedelta, durations may not exceed 999,999,999 days'):
         v.validate_python(f'{999_999_999 + 1}days, 12:34')
+
+
+@pytest.mark.skipif(not pandas, reason='pandas not installed')
+def test_pandas():
+    v = SchemaValidator({'type': 'timedelta', 'ge': timedelta(hours=2)})
+    two_hours = pandas.Timestamp('2023-01-01T02:00:00Z') - pandas.Timestamp('2023-01-01T00:00:00Z')
+
+    assert v.validate_python(two_hours) == two_hours
+    assert v.validate_python(two_hours.to_pytimedelta()) == two_hours
+
+    one_55 = pandas.Timestamp('2023-01-01T01:55:00Z') - pandas.Timestamp('2023-01-01T00:00:00Z')
+    msg = r'Input should be greater than or equal to 2 hours'
+    with pytest.raises(ValidationError, match=msg):
+        v.validate_python(one_55)
+    with pytest.raises(ValidationError, match=msg):
+        v.validate_python(one_55.to_pytimedelta())

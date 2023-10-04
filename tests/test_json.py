@@ -142,7 +142,7 @@ def test_error_loc():
             'fields': {
                 'field_a': {'type': 'typed-dict-field', 'schema': {'type': 'list', 'items_schema': {'type': 'int'}}}
             },
-            'extra_validator': {'type': 'int'},
+            'extras_schema': {'type': 'int'},
             'extra_behavior': 'allow',
         }
     )
@@ -254,18 +254,23 @@ def test_to_jsonable_python_schema_serializer():
 
     # force a recursive model to ensure we exercise the transfer of definitions from the loaded
     # serializer
-    c = core_schema.model_schema(
-        Foobar,
-        core_schema.typed_dict_schema(
-            {
-                'my_foo': core_schema.typed_dict_field(core_schema.int_schema(), serialization_alias='myFoo'),
-                'my_inners': core_schema.typed_dict_field(
-                    core_schema.list_schema(core_schema.definition_reference_schema('foobar')),
-                    serialization_alias='myInners',
+    c = core_schema.definitions_schema(
+        core_schema.definition_reference_schema(schema_ref='foobar'),
+        [
+            core_schema.model_schema(
+                Foobar,
+                core_schema.typed_dict_schema(
+                    {
+                        'my_foo': core_schema.typed_dict_field(core_schema.int_schema(), serialization_alias='myFoo'),
+                        'my_inners': core_schema.typed_dict_field(
+                            core_schema.list_schema(core_schema.definition_reference_schema('foobar')),
+                            serialization_alias='myInners',
+                        ),
+                    }
                 ),
-            }
-        ),
-        ref='foobar',
+                ref='foobar',
+            )
+        ],
     )
     v = SchemaValidator(c)
     s = SchemaSerializer(c)
@@ -327,7 +332,12 @@ def test_json_key_fallback():
     assert to_json(x, fallback=fallback_func) == b'{"fallback:FoobarHash":1}'
 
 
-class BadRepr:
+class BedReprMeta(type):
+    def __repr__(self):
+        raise ValueError('bad repr')
+
+
+class BadRepr(metaclass=BedReprMeta):
     def __repr__(self):
         raise ValueError('bad repr')
 
@@ -338,7 +348,7 @@ class BadRepr:
 def test_bad_repr():
     b = BadRepr()
 
-    error_msg = '^Unable to serialize unknown type: <unprintable BadRepr object>$'
+    error_msg = '^Unable to serialize unknown type: <unprintable BedReprMeta object>$'
     with pytest.raises(PydanticSerializationError, match=error_msg):
         to_jsonable_python(b)
 

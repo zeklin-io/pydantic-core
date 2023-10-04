@@ -1,7 +1,7 @@
 import pytest
 from dirty_equals import IsFloat, IsInt
 
-from pydantic_core import SchemaError, SchemaValidator, ValidationError, core_schema
+from pydantic_core import SchemaError, SchemaValidator, ValidationError, core_schema, validate_core_schema
 
 from ..conftest import plain_repr
 
@@ -234,7 +234,7 @@ def test_union_list_bool_int():
 
 def test_no_choices(pydantic_version):
     with pytest.raises(SchemaError) as exc_info:
-        SchemaValidator({'type': 'union'})
+        validate_core_schema({'type': 'union'})
 
     assert str(exc_info.value) == (
         'Invalid Schema:\n'
@@ -256,7 +256,10 @@ def test_empty_choices():
 
 def test_one_choice():
     v = SchemaValidator({'type': 'union', 'choices': [{'type': 'str'}]})
-    assert plain_repr(v) == 'SchemaValidator(title="str",validator=Str(StrValidator{strict:false}),definitions=[])'
+    assert (
+        plain_repr(v)
+        == 'SchemaValidator(title="str",validator=Str(StrValidator{strict:false,coerce_numbers_to_str:false}),definitions=[])'
+    )
     assert v.validate_python('hello') == 'hello'
 
 
@@ -396,14 +399,19 @@ def test_no_strict_check():
 
 def test_strict_reference():
     v = SchemaValidator(
-        core_schema.tuple_positional_schema(
+        core_schema.definitions_schema(
+            core_schema.definition_reference_schema(schema_ref='tuple-ref'),
             [
-                core_schema.float_schema(),
-                core_schema.union_schema(
-                    [core_schema.int_schema(), core_schema.definition_reference_schema('tuple-ref')]
-                ),
+                core_schema.tuple_positional_schema(
+                    [
+                        core_schema.float_schema(),
+                        core_schema.union_schema(
+                            [core_schema.int_schema(), core_schema.definition_reference_schema('tuple-ref')]
+                        ),
+                    ],
+                    ref='tuple-ref',
+                )
             ],
-            ref='tuple-ref',
         )
     )
     assert 'strict_required:true' in plain_repr(v)
@@ -411,3 +419,85 @@ def test_strict_reference():
 
     assert repr(v.validate_python((1, 2))) == '(1.0, 2)'
     assert repr(v.validate_python((1.0, (2.0, 3)))) == '(1.0, (2.0, 3))'
+
+
+def test_case_labels():
+    v = SchemaValidator(
+        {'type': 'union', 'choices': [{'type': 'none'}, ({'type': 'int'}, 'my_label'), {'type': 'str'}]}
+    )
+    assert v.validate_python(None) is None
+    assert v.validate_python(1) == 1
+    with pytest.raises(ValidationError, match=r'3 validation errors for union\[none,my_label,str]') as exc_info:
+        v.validate_python(1.5)
+    assert exc_info.value.errors(include_url=False) == [
+        {'input': 1.5, 'loc': ('none',), 'msg': 'Input should be None', 'type': 'none_required'},
+        {
+            'input': 1.5,
+            'loc': ('my_label',),
+            'msg': 'Input should be a valid integer, got a number with a fractional part',
+            'type': 'int_from_float',
+        },
+        {'input': 1.5, 'loc': ('str',), 'msg': 'Input should be a valid string', 'type': 'string_type'},
+    ]
+
+
+def test_left_to_right_doesnt_care_about_strict_check():
+    v = SchemaValidator(
+        core_schema.union_schema([core_schema.int_schema(), core_schema.json_schema()], mode='left_to_right')
+    )
+    assert 'strict_required' not in plain_repr(v)
+    assert 'ultra_strict_required' not in plain_repr(v)
+
+
+def test_left_to_right_union():
+    choices = [core_schema.int_schema(), core_schema.float_schema()]
+
+    # smart union prefers float
+    v = SchemaValidator(core_schema.union_schema(choices, mode='smart'))
+    out = v.validate_python(1.0)
+    assert out == 1.0
+    assert isinstance(out, float)
+
+    # left_to_right union will select int
+    v = SchemaValidator(core_schema.union_schema(choices, mode='left_to_right'))
+    out = v.validate_python(1)
+    assert out == 1
+    assert isinstance(out, int)
+
+    out = v.validate_python(1.0)
+    assert out == 1
+    assert isinstance(out, int)
+
+    # reversing them will select float
+    v = SchemaValidator(core_schema.union_schema(list(reversed(choices)), mode='left_to_right'))
+    out = v.validate_python(1.0)
+    assert out == 1.0
+    assert isinstance(out, float)
+
+    out = v.validate_python(1)
+    assert out == 1.0
+    assert isinstance(out, float)
+
+
+def test_left_to_right_union_strict():
+    choices = [core_schema.int_schema(), core_schema.float_schema()]
+
+    # left_to_right union will select not cast if int first (strict int will not accept float)
+    v = SchemaValidator(core_schema.union_schema(choices, mode='left_to_right', strict=True))
+    out = v.validate_python(1)
+    assert out == 1
+    assert isinstance(out, int)
+
+    out = v.validate_python(1.0)
+    assert out == 1.0
+    assert isinstance(out, float)
+
+    # reversing union will select float always (as strict float will accept int)
+    v = SchemaValidator(core_schema.union_schema(list(reversed(choices)), mode='left_to_right', strict=True))
+    out = v.validate_python(1.0)
+    assert out == 1.0
+    assert isinstance(out, float)
+
+    out = v.validate_python(1)
+    assert out == 1.0
+    assert isinstance(out, float)

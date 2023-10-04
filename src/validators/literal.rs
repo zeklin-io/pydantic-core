@@ -11,10 +11,9 @@ use crate::build_tools::{py_schema_err, py_schema_error_type};
 use crate::errors::{ErrorType, ValError, ValResult};
 use crate::input::Input;
 use crate::py_gc::PyGcTraverse;
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
 #[derive(Debug, Clone)]
 struct BoolLiteral {
@@ -23,7 +22,7 @@ struct BoolLiteral {
 }
 
 #[derive(Debug, Clone)]
-pub struct LiteralLookup<T: Clone + Debug> {
+pub struct LiteralLookup<T: Debug> {
     // Specialized lookups for ints, bools and strings because they
     // (1) are easy to convert between Rust and Python
     // (2) hashing them in Rust is very fast
@@ -36,7 +35,7 @@ pub struct LiteralLookup<T: Clone + Debug> {
     pub values: Vec<T>,
 }
 
-impl<T: Clone + Debug> LiteralLookup<T> {
+impl<T: Debug> LiteralLookup<T> {
     pub fn new<'py>(py: Python<'py>, expected: impl Iterator<Item = (&'py PyAny, T)>) -> PyResult<Self> {
         let mut expected_int = AHashMap::new();
         let mut expected_str: AHashMap<String, usize> = AHashMap::new();
@@ -136,7 +135,7 @@ impl<T: Clone + Debug> LiteralLookup<T> {
     }
 }
 
-impl<T: PyGcTraverse + Clone + Debug> PyGcTraverse for LiteralLookup<T> {
+impl<T: PyGcTraverse + Debug> PyGcTraverse for LiteralLookup<T> {
     fn py_gc_traverse(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
         self.expected_py.py_gc_traverse(visit)?;
         self.values.py_gc_traverse(visit)?;
@@ -165,7 +164,7 @@ impl BuildValidator for LiteralValidator {
         }
         let py = expected.py();
         let mut repr_args: Vec<String> = Vec::new();
-        for item in expected.iter() {
+        for item in expected {
             repr_args.push(item.repr()?.extract()?);
         }
         let (expected_repr, name) = expected_repr_name(repr_args, "literal");
@@ -181,30 +180,25 @@ impl BuildValidator for LiteralValidator {
 impl_py_gc_traverse!(LiteralValidator { lookup });
 
 impl Validator for LiteralValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        _extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        _state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
         match self.lookup.validate(py, input)? {
             Some((_, v)) => Ok(v.clone()),
             None => Err(ValError::new(
                 ErrorType::LiteralError {
                     expected: self.expected_repr.clone(),
+                    context: None,
                 },
                 input,
             )),
         }
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         !ultra_strict
     }
 
@@ -212,7 +206,7 @@ impl Validator for LiteralValidator {
         &self.name
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }

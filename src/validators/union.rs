@@ -1,8 +1,11 @@
 use std::fmt::Write;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
+use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use pyo3::{intern, PyTraverseError, PyVisit};
+use smallvec::SmallVec;
 
 use crate::build_tools::py_schema_err;
 use crate::build_tools::{is_strict, schema_or_config};
@@ -10,21 +13,65 @@ use crate::errors::{ErrorType, LocItem, ValError, ValLineError, ValResult};
 use crate::input::{GenericMapping, Input};
 use crate::lookup_key::LookupKey;
 use crate::py_gc::PyGcTraverse;
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
 use super::custom_error::CustomError;
 use super::literal::LiteralLookup;
-use super::{build_validator, BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::{build_validator, BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+enum UnionMode {
+    Smart {
+        strict_required: AtomicBool,
+        ultra_strict_required: AtomicBool,
+    },
+    LeftToRight,
+}
+
+impl UnionMode {
+    // construct smart with some default values
+    const fn default_smart() -> Self {
+        Self::Smart {
+            strict_required: AtomicBool::new(true),
+            ultra_strict_required: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Clone for UnionMode {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Smart {
+                strict_required,
+                ultra_strict_required,
+            } => Self::Smart {
+                strict_required: AtomicBool::new(strict_required.load(Ordering::SeqCst)),
+                ultra_strict_required: AtomicBool::new(ultra_strict_required.load(Ordering::SeqCst)),
+            },
+            Self::LeftToRight => Self::LeftToRight,
+        }
+    }
+}
+
+impl FromStr for UnionMode {
+    type Err = PyErr;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "smart" => Ok(Self::default_smart()),
+            "left_to_right" => Ok(Self::LeftToRight),
+            s => py_schema_err!("Invalid union mode: `{}`, expected `smart` or `left_to_right`", s),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct UnionValidator {
-    choices: Vec<CombinedValidator>,
+    mode: UnionMode,
+    choices: Vec<(CombinedValidator, Option<String>)>,
     custom_error: Option<CustomError>,
     strict: bool,
     name: String,
-    strict_required: bool,
-    ultra_strict_required: bool,
 }
 
 impl BuildValidator for UnionValidator {
@@ -36,26 +83,43 @@ impl BuildValidator for UnionValidator {
         definitions: &mut DefinitionsBuilder<CombinedValidator>,
     ) -> PyResult<CombinedValidator> {
         let py = schema.py();
-        let choices: Vec<CombinedValidator> = schema
+        let choices: Vec<(CombinedValidator, Option<String>)> = schema
             .get_as_req::<&PyList>(intern!(py, "choices"))?
             .iter()
-            .map(|choice| build_validator(choice, config, definitions))
-            .collect::<PyResult<Vec<CombinedValidator>>>()?;
+            .map(|choice| {
+                let mut label: Option<String> = None;
+                let choice: &PyAny = match choice.downcast::<PyTuple>() {
+                    Ok(py_tuple) => {
+                        let choice = py_tuple.get_item(0)?;
+                        label = Some(py_tuple.get_item(1)?.to_string());
+                        choice
+                    }
+                    Err(_) => choice,
+                };
+                Ok((build_validator(choice, config, definitions)?, label))
+            })
+            .collect::<PyResult<Vec<(CombinedValidator, Option<String>)>>>()?;
 
         let auto_collapse = || schema.get_as_req(intern!(py, "auto_collapse")).unwrap_or(true);
+        let mode = schema
+            .get_as::<&str>(intern!(py, "mode"))?
+            .map_or(Ok(UnionMode::default_smart()), UnionMode::from_str)?;
         match choices.len() {
             0 => py_schema_err!("One or more union choices required"),
-            1 if auto_collapse() => Ok(choices.into_iter().next().unwrap()),
+            1 if auto_collapse() => Ok(choices.into_iter().next().unwrap().0),
             _ => {
-                let descr = choices.iter().map(Validator::get_name).collect::<Vec<_>>().join(",");
+                let descr = choices
+                    .iter()
+                    .map(|(choice, label)| label.as_deref().unwrap_or(choice.get_name()))
+                    .collect::<Vec<_>>()
+                    .join(",");
 
                 Ok(Self {
+                    mode,
                     choices,
                     custom_error: CustomError::build(schema, config, definitions)?,
                     strict: is_strict(schema, config)?,
                     name: format!("{}[{descr}]", Self::EXPECTED_TYPE),
-                    strict_required: true,
-                    ultra_strict_required: false,
                 }
                 .into())
             }
@@ -64,125 +128,207 @@ impl BuildValidator for UnionValidator {
 }
 
 impl UnionValidator {
-    fn or_custom_error<'s, 'data>(
-        &'s self,
-        errors: Option<Vec<ValLineError<'data>>>,
-        input: &'data impl Input<'data>,
-    ) -> ValError<'data> {
-        if let Some(errors) = errors {
-            ValError::LineErrors(errors)
-        } else {
-            self.custom_error.as_ref().unwrap().as_val_error(input)
-        }
-    }
-}
-
-impl_py_gc_traverse!(UnionValidator { choices });
-
-impl Validator for UnionValidator {
-    fn validate<'s, 'data>(
+    fn validate_smart<'s, 'data>(
         &'s self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        definitions: &'data Definitions<CombinedValidator>,
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
+        strict_required: bool,
+        ultra_strict_required: bool,
     ) -> ValResult<'data, PyObject> {
-        if self.ultra_strict_required {
+        if ultra_strict_required {
             // do an ultra strict check first
-            let ultra_strict_extra = extra.as_strict(true);
+            let state = &mut state.rebind_extra(|extra| {
+                extra.strict = Some(true);
+                extra.ultra_strict = true;
+            });
             if let Some(res) = self
                 .choices
                 .iter()
-                .map(|validator| validator.validate(py, input, &ultra_strict_extra, definitions, recursion_guard))
+                .map(|(validator, _label)| validator.validate(py, input, state))
                 .find(ValResult::is_ok)
             {
                 return res;
             }
         }
 
-        if extra.strict.unwrap_or(self.strict) {
-            let mut errors: Option<Vec<ValLineError>> = match self.custom_error {
-                None => Some(Vec::with_capacity(self.choices.len())),
-                _ => None,
-            };
-            let strict_extra = extra.as_strict(false);
+        let mut errors = MaybeErrors::new(self.custom_error.as_ref());
 
-            for validator in &self.choices {
-                let line_errors = match validator.validate(py, input, &strict_extra, definitions, recursion_guard) {
-                    Err(ValError::LineErrors(line_errors)) => line_errors,
+        if state.strict_or(self.strict) {
+            let state = &mut state.rebind_extra(|extra| extra.strict = Some(true));
+            for (validator, label) in &self.choices {
+                match validator.validate(py, input, state) {
+                    Err(ValError::LineErrors(lines)) => errors.push(validator, label.as_deref(), lines),
                     otherwise => return otherwise,
                 };
-
-                if let Some(ref mut errors) = errors {
-                    errors.extend(
-                        line_errors
-                            .into_iter()
-                            .map(|err| err.with_outer_location(validator.get_name().into())),
-                    );
-                }
             }
 
-            Err(self.or_custom_error(errors, input))
+            Err(errors.into_val_error(input))
         } else {
-            if self.strict_required {
+            if strict_required {
                 // 1st pass: check if the value is an exact instance of one of the Union types,
                 // e.g. use validate in strict mode
-                let strict_extra = extra.as_strict(false);
+                let state = &mut state.rebind_extra(|extra| extra.strict = Some(true));
                 if let Some(res) = self
                     .choices
                     .iter()
-                    .map(|validator| validator.validate(py, input, &strict_extra, definitions, recursion_guard))
+                    .map(|(validator, _label)| validator.validate(py, input, state))
                     .find(ValResult::is_ok)
                 {
                     return res;
                 }
             }
 
-            let mut errors: Option<Vec<ValLineError>> = match self.custom_error {
-                None => Some(Vec::with_capacity(self.choices.len())),
-                _ => None,
-            };
-
             // 2nd pass: check if the value can be coerced into one of the Union types, e.g. use validate
-            for validator in &self.choices {
-                let line_errors = match validator.validate(py, input, extra, definitions, recursion_guard) {
-                    Err(ValError::LineErrors(line_errors)) => line_errors,
-                    success => return success,
+            for (validator, label) in &self.choices {
+                match validator.validate(py, input, state) {
+                    Err(ValError::LineErrors(lines)) => errors.push(validator, label.as_deref(), lines),
+                    otherwise => return otherwise,
                 };
-
-                if let Some(ref mut errors) = errors {
-                    errors.extend(
-                        line_errors
-                            .into_iter()
-                            .map(|err| err.with_outer_location(validator.get_name().into())),
-                    );
-                }
             }
 
-            Err(self.or_custom_error(errors, input))
+            Err(errors.into_val_error(input))
         }
     }
 
-    fn different_strict_behavior(
+    fn validate_left_to_right<'s, 'data>(
+        &'s self,
+        py: Python<'data>,
+        input: &'data impl Input<'data>,
+        state: &mut ValidationState,
+    ) -> ValResult<'data, PyObject> {
+        let mut errors = MaybeErrors::new(self.custom_error.as_ref());
+
+        let mut rebound_state;
+        let state = if state.strict_or(self.strict) {
+            rebound_state = state.rebind_extra(|extra| extra.strict = Some(true));
+            &mut rebound_state
+        } else {
+            state
+        };
+
+        for (validator, label) in &self.choices {
+            match validator.validate(py, input, state) {
+                Err(ValError::LineErrors(lines)) => errors.push(validator, label.as_deref(), lines),
+                otherwise => return otherwise,
+            };
+        }
+
+        Err(errors.into_val_error(input))
+    }
+}
+
+impl PyGcTraverse for UnionValidator {
+    fn py_gc_traverse(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
+        self.choices.iter().try_for_each(|(v, _)| v.py_gc_traverse(visit))?;
+        Ok(())
+    }
+}
+
+impl Validator for UnionValidator {
+    fn validate<'data>(
         &self,
-        definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+        py: Python<'data>,
+        input: &'data impl Input<'data>,
+        state: &mut ValidationState,
+    ) -> ValResult<'data, PyObject> {
+        match &self.mode {
+            UnionMode::Smart {
+                strict_required,
+                ultra_strict_required,
+            } => self.validate_smart(
+                py,
+                input,
+                state,
+                strict_required.load(Ordering::SeqCst),
+                ultra_strict_required.load(Ordering::SeqCst),
+            ),
+            UnionMode::LeftToRight => self.validate_left_to_right(py, input, state),
+        }
+    }
+
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         self.choices
             .iter()
-            .any(|v| v.different_strict_behavior(definitions, ultra_strict))
+            .any(|(v, _)| v.different_strict_behavior(ultra_strict))
     }
 
     fn get_name(&self) -> &str {
         &self.name
     }
 
-    fn complete(&mut self, definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
-        self.choices.iter_mut().try_for_each(|v| v.complete(definitions))?;
-        self.strict_required = self.different_strict_behavior(Some(definitions), false);
-        self.ultra_strict_required = self.different_strict_behavior(Some(definitions), true);
+    fn complete(&self) -> PyResult<()> {
+        self.choices.iter().try_for_each(|(v, _)| v.complete())?;
+        if let UnionMode::Smart {
+            strict_required,
+            ultra_strict_required,
+        } = &self.mode
+        {
+            strict_required.store(
+                self.choices.iter().any(|(v, _)| v.different_strict_behavior(false)),
+                Ordering::SeqCst,
+            );
+            ultra_strict_required.store(
+                self.choices.iter().any(|(v, _)| v.different_strict_behavior(true)),
+                Ordering::SeqCst,
+            );
+        }
+
         Ok(())
+    }
+}
+
+struct ChoiceLineErrors<'a, 'data> {
+    choice: &'a CombinedValidator,
+    label: Option<&'a str>,
+    line_errors: Vec<ValLineError<'data>>,
+}
+
+enum MaybeErrors<'a, 'data> {
+    Custom(&'a CustomError),
+    Errors(SmallVec<[ChoiceLineErrors<'a, 'data>; 4]>),
+}
+
+impl<'a, 'data> MaybeErrors<'a, 'data> {
+    fn new(custom_error: Option<&'a CustomError>) -> Self {
+        match custom_error {
+            Some(custom_error) => Self::Custom(custom_error),
+            None => Self::Errors(SmallVec::new()),
+        }
+    }
+
+    fn push(&mut self, choice: &'a CombinedValidator, label: Option<&'a str>, line_errors: Vec<ValLineError<'data>>) {
+        match self {
+            Self::Custom(_) => {}
+            Self::Errors(errors) => errors.push(ChoiceLineErrors {
+                choice,
+                label,
+                line_errors,
+            }),
+        }
+    }
+
+    fn into_val_error(self, input: &'data impl Input<'data>) -> ValError<'data> {
+        match self {
+            Self::Custom(custom_error) => custom_error.as_val_error(input),
+            Self::Errors(errors) => ValError::LineErrors(
+                errors
+                    .into_iter()
+                    .flat_map(
+                        |ChoiceLineErrors {
+                             choice,
+                             label,
+                             line_errors,
+                         }| {
+                            line_errors.into_iter().map(move |err| {
+                                let case_label = label.unwrap_or(choice.get_name());
+                                err.with_outer_location(case_label.into())
+                            })
+                        },
+                    )
+                    .collect(),
+            ),
+        }
     }
 }
 
@@ -229,7 +375,7 @@ impl PyGcTraverse for Discriminator {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TaggedUnionValidator {
     discriminator: Discriminator,
     lookup: LiteralLookup<CombinedValidator>,
@@ -260,7 +406,7 @@ impl BuildValidator for TaggedUnionValidator {
         let mut discriminators = Vec::with_capacity(choices.len());
         let schema_choices: &PyDict = schema.get_as_req(intern!(py, "choices"))?;
         let mut lookup_map = Vec::with_capacity(choices.len());
-        for (choice_key, choice_schema) in schema_choices.iter() {
+        for (choice_key, choice_schema) in schema_choices {
             discriminators.push(choice_key);
             let validator = build_validator(choice_schema, config, definitions)?;
             let tag_repr = choice_key.repr()?.to_string();
@@ -303,13 +449,11 @@ impl BuildValidator for TaggedUnionValidator {
 impl_py_gc_traverse!(TaggedUnionValidator { discriminator, lookup });
 
 impl Validator for TaggedUnionValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        definitions: &'data Definitions<CombinedValidator>,
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
         match self.discriminator {
             Discriminator::LookupKey(ref lookup_key) => {
@@ -325,55 +469,44 @@ impl Validator for TaggedUnionValidator {
                         }
                     }};
                 }
-                let from_attributes = extra.from_attributes.unwrap_or(self.from_attributes);
+                let from_attributes = state.extra().from_attributes.unwrap_or(self.from_attributes);
                 let dict = input.validate_model_fields(self.strict, from_attributes)?;
                 let tag = match dict {
                     GenericMapping::PyDict(dict) => find_validator!(py_get_dict_item, dict),
-                    GenericMapping::PyGetAttr(obj, kwargs) => find_validator!(py_get_attr, obj, kwargs),
                     GenericMapping::PyMapping(mapping) => find_validator!(py_get_mapping_item, mapping),
+                    GenericMapping::StringMapping(d) => find_validator!(py_get_dict_item, d),
+                    GenericMapping::PyGetAttr(obj, kwargs) => find_validator!(py_get_attr, obj, kwargs),
                     GenericMapping::JsonObject(mapping) => find_validator!(json_get, mapping),
                 }?;
-                self.find_call_validator(py, tag, input, extra, definitions, recursion_guard)
+                self.find_call_validator(py, tag, input, state)
             }
             Discriminator::Function(ref func) => {
                 let tag = func.call1(py, (input.to_object(py),))?;
                 if tag.is_none(py) {
                     Err(self.tag_not_found(input))
                 } else {
-                    self.find_call_validator(py, tag.into_ref(py), input, extra, definitions, recursion_guard)
+                    self.find_call_validator(py, tag.into_ref(py), input, state)
                 }
             }
-            Discriminator::SelfSchema => self.find_call_validator(
-                py,
-                self.self_schema_tag(py, input)?.as_ref(),
-                input,
-                extra,
-                definitions,
-                recursion_guard,
-            ),
+            Discriminator::SelfSchema => {
+                self.find_call_validator(py, self.self_schema_tag(py, input)?.as_ref(), input, state)
+            }
         }
     }
 
-    fn different_strict_behavior(
-        &self,
-        definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         self.lookup
             .values
             .iter()
-            .any(|v| v.different_strict_behavior(definitions, ultra_strict))
+            .any(|v| v.different_strict_behavior(ultra_strict))
     }
 
     fn get_name(&self) -> &str {
         &self.name
     }
 
-    fn complete(&mut self, definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
-        self.lookup
-            .values
-            .iter_mut()
-            .try_for_each(|validator| validator.complete(definitions))
+    fn complete(&self) -> PyResult<()> {
+        self.lookup.values.iter().try_for_each(CombinedValidator::complete)
     }
 }
 
@@ -428,12 +561,10 @@ impl TaggedUnionValidator {
         py: Python<'data>,
         tag: &'data PyAny,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        definitions: &'data Definitions<CombinedValidator>,
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
         if let Ok(Some((tag, validator))) = self.lookup.validate(py, tag) {
-            return match validator.validate(py, input, extra, definitions, recursion_guard) {
+            return match validator.validate(py, input, state) {
                 Ok(res) => Ok(res),
                 Err(err) => Err(err.with_outer_location(LocItem::try_from(tag.to_object(py).into_ref(py))?)),
             };
@@ -445,6 +576,7 @@ impl TaggedUnionValidator {
                     discriminator: self.discriminator_repr.clone(),
                     tag: tag.to_string(),
                     expected_tags: self.tags_repr.clone(),
+                    context: None,
                 },
                 input,
             )),
@@ -457,6 +589,7 @@ impl TaggedUnionValidator {
             None => ValError::new(
                 ErrorType::UnionTagNotFound {
                     discriminator: self.discriminator_repr.clone(),
+                    context: None,
                 },
                 input,
             ),

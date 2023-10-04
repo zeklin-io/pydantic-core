@@ -6,10 +6,10 @@ use pyo3::types::PyDict;
 use crate::build_tools::is_strict;
 use crate::errors::{ErrorType, ValError, ValResult};
 use crate::input::{Input, Int};
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::ValidationState;
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, Validator};
 
 #[derive(Debug, Clone)]
 pub struct IntValidator {
@@ -44,22 +44,17 @@ impl BuildValidator for IntValidator {
 impl_py_gc_traverse!(IntValidator {});
 
 impl Validator for IntValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        Ok(input.validate_int(extra.strict.unwrap_or(self.strict))?.into_py(py))
+        let either_int = input.validate_int(state.strict_or(self.strict))?;
+        Ok(either_int.into_py(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         !ultra_strict
     }
 
@@ -67,7 +62,7 @@ impl Validator for IntValidator {
         Self::EXPECTED_TYPE
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }
@@ -85,15 +80,13 @@ pub struct ConstrainedIntValidator {
 impl_py_gc_traverse!(ConstrainedIntValidator {});
 
 impl Validator for ConstrainedIntValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        let either_int = input.validate_int(extra.strict.unwrap_or(self.strict))?;
+        let either_int = input.validate_int(state.strict_or(self.strict))?;
         let int_value = either_int.as_int()?;
 
         if let Some(ref multiple_of) = self.multiple_of {
@@ -101,6 +94,7 @@ impl Validator for ConstrainedIntValidator {
                 return Err(ValError::new(
                     ErrorType::MultipleOf {
                         multiple_of: multiple_of.clone().into(),
+                        context: None,
                     },
                     input,
                 ));
@@ -108,35 +102,52 @@ impl Validator for ConstrainedIntValidator {
         }
         if let Some(ref le) = self.le {
             if &int_value > le {
-                return Err(ValError::new(ErrorType::LessThanEqual { le: le.clone().into() }, input));
+                return Err(ValError::new(
+                    ErrorType::LessThanEqual {
+                        le: le.clone().into(),
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
         if let Some(ref lt) = self.lt {
             if &int_value >= lt {
-                return Err(ValError::new(ErrorType::LessThan { lt: lt.clone().into() }, input));
+                return Err(ValError::new(
+                    ErrorType::LessThan {
+                        lt: lt.clone().into(),
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
         if let Some(ref ge) = self.ge {
             if &int_value < ge {
                 return Err(ValError::new(
-                    ErrorType::GreaterThanEqual { ge: ge.clone().into() },
+                    ErrorType::GreaterThanEqual {
+                        ge: ge.clone().into(),
+                        context: None,
+                    },
                     input,
                 ));
             }
         }
         if let Some(ref gt) = self.gt {
             if &int_value <= gt {
-                return Err(ValError::new(ErrorType::GreaterThan { gt: gt.clone().into() }, input));
+                return Err(ValError::new(
+                    ErrorType::GreaterThan {
+                        gt: gt.clone().into(),
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
         Ok(either_int.into_py(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         !ultra_strict
     }
 
@@ -144,7 +155,7 @@ impl Validator for ConstrainedIntValidator {
         "constrained-int"
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }

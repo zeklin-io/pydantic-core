@@ -1,14 +1,10 @@
-#![cfg_attr(has_no_coverage, feature(no_coverage))]
+#![cfg_attr(has_coverage_attribute, feature(coverage_attribute))]
 
 extern crate core;
 
 use std::sync::OnceLock;
 
 use pyo3::{prelude::*, sync::GILOnceCell};
-
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // parse this first to get access to the contained macro
 #[macro_use]
@@ -38,7 +34,7 @@ pub use errors::{
 pub use serializers::{
     to_json, to_jsonable_python, PydanticSerializationError, PydanticSerializationUnexpectedValue, SchemaSerializer,
 };
-pub use validators::{PySome, SchemaValidator};
+pub use validators::{validate_core_schema, PySome, SchemaValidator};
 
 pub fn get_pydantic_core_version() -> &'static str {
     static PYDANTIC_CORE_VERSION: OnceLock<String> = OnceLock::new();
@@ -69,10 +65,9 @@ fn get_pydantic_version(py: Python<'_>) -> Option<&'static str> {
 
 pub fn build_info() -> String {
     format!(
-        "profile={} pgo={} mimalloc={}",
+        "profile={} pgo={}",
         env!("PROFILE"),
         option_env!("RUSTFLAGS").unwrap_or("").contains("-Cprofile-use="),
-        cfg!(feature = "mimalloc")
     )
 }
 
@@ -102,9 +97,6 @@ fn _pydantic_core(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(to_json, m)?)?;
     m.add_function(wrap_pyfunction!(to_jsonable_python, m)?)?;
     m.add_function(wrap_pyfunction!(list_all_errors, m)?)?;
-
-    #[cfg(not(feature = "mimalloc"))]
-    m.setattr("__pydantic_core_default_allocator__", true)?; // uses setattr so this is not in __all__
-
+    m.add_function(wrap_pyfunction!(validate_core_schema, m)?)?;
     Ok(())
 }

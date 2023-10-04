@@ -48,7 +48,7 @@ def tz(**kwargs):
         (datetime(2022, 12, 2, 12, tzinfo=tz(hours=-2, minutes=-30)), '2022-12-02T12:00:00-02:30'),
         (datetime(2022, 12, 2, 12, 13, 14, 123456), '2022-12-02T12:13:14.123456'),
         (datetime(2022, 12, 2, 12, 13, 14, 123), '2022-12-02T12:13:14.000123'),
-        (datetime(2022, 12, 2, 12, 13, 14, 123_000), '2022-12-02T12:13:14.123'),
+        (datetime(2022, 12, 2, 12, 13, 14, 123_000), '2022-12-02T12:13:14.123000'),
         (datetime(2022, 12, 2, 12, 13, 14, 123456, tzinfo=tz(hours=-2)), '2022-12-02T12:13:14.123456-02:00'),
     ],
 )
@@ -83,7 +83,7 @@ def test_time():
     assert v.to_json(time(12, 13, 14)) == b'"12:13:14"'
     assert v.to_json(time(12, 13, 14, 123_456)) == b'"12:13:14.123456"'
     assert v.to_json(time(12, 13, 14, 123)) == b'"12:13:14.000123"'
-    assert v.to_json(time(12, 13, 14, 123_000)) == b'"12:13:14.123"'
+    assert v.to_json(time(12, 13, 14, 123_000)) == b'"12:13:14.123000"'
 
 
 def test_time_key():
@@ -99,3 +99,11 @@ def test_any_datetime_key():
     # assert v.to_python(input_value) == v
     assert v.to_python(input_value, mode='json') == {'2022-12-02T12:13:14': 1, '2022-12-02': 2, '12:13:14': 3}
     assert v.to_json(input_value) == b'{"2022-12-02T12:13:14":1,"2022-12-02":2,"12:13:14":3}'
+
+
+def test_date_datetime_union():
+    # See https://github.com/pydantic/pydantic/issues/7039#issuecomment-1671986746
+    v = SchemaSerializer(core_schema.union_schema([core_schema.date_schema(), core_schema.datetime_schema()]))
+    assert v.to_python(datetime(2022, 12, 2, 1)) == datetime(2022, 12, 2, 1)
+    assert v.to_python(datetime(2022, 12, 2, 1), mode='json') == '2022-12-02T01:00:00'
+    assert v.to_json(datetime(2022, 12, 2, 1)) == b'"2022-12-02T01:00:00"'

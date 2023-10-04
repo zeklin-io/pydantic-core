@@ -1,6 +1,6 @@
 import pytest
 
-from pydantic_core import SchemaError, SchemaSerializer, core_schema
+from pydantic_core import SchemaError, SchemaSerializer, core_schema, validate_core_schema
 
 
 def test_custom_ser():
@@ -25,7 +25,7 @@ def test_ignored_def():
 
 def test_def_error():
     with pytest.raises(SchemaError) as exc_info:
-        SchemaSerializer(
+        validate_core_schema(
             core_schema.definitions_schema(
                 core_schema.list_schema(core_schema.definition_reference_schema('foobar')),
                 [core_schema.int_schema(ref='foobar'), {'type': 'wrong'}],
@@ -42,9 +42,12 @@ def test_repeated_ref():
         SchemaSerializer(
             core_schema.tuple_positional_schema(
                 [
-                    core_schema.int_schema(ref='foobar'),
-                    core_schema.definition_reference_schema('foobar'),
-                    core_schema.int_schema(ref='foobar'),
+                    core_schema.definitions_schema(
+                        core_schema.definition_reference_schema('foobar'), [core_schema.int_schema(ref='foobar')]
+                    ),
+                    core_schema.definitions_schema(
+                        core_schema.definition_reference_schema('foobar'), [core_schema.int_schema(ref='foobar')]
+                    ),
                 ]
             )
         )
@@ -53,14 +56,16 @@ def test_repeated_ref():
 def test_repeat_after():
     with pytest.raises(SchemaError, match='SchemaError: Duplicate ref: `foobar`'):
         SchemaSerializer(
-            core_schema.tuple_positional_schema(
-                [
-                    core_schema.definitions_schema(
-                        core_schema.list_schema(core_schema.definition_reference_schema('foobar')),
-                        [core_schema.int_schema(ref='foobar')],
-                    ),
-                    core_schema.int_schema(ref='foobar'),
-                ]
+            core_schema.definitions_schema(
+                core_schema.tuple_positional_schema(
+                    [
+                        core_schema.definitions_schema(
+                            core_schema.definition_reference_schema('foobar'), [core_schema.int_schema(ref='foobar')]
+                        ),
+                        core_schema.definition_reference_schema('foobar'),
+                    ]
+                ),
+                [core_schema.int_schema(ref='foobar')],
             )
         )
 

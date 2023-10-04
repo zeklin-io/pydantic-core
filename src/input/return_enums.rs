@@ -10,7 +10,8 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::iter::PyDictIterator;
 use pyo3::types::{
-    PyByteArray, PyBytes, PyDict, PyFrozenSet, PyIterator, PyList, PyMapping, PySequence, PySet, PyString, PyTuple,
+    PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyIterator, PyList, PyMapping, PySequence, PySet, PyString,
+    PyTuple,
 };
 use pyo3::{ffi, intern, AsPyPointer, PyNativeType};
 
@@ -20,11 +21,11 @@ use pyo3::types::PyFunction;
 use pyo3::PyTypeInfo;
 use serde::{ser::Error, Serialize, Serializer};
 
-use crate::errors::{py_err_string, ErrorType, InputValue, ValError, ValLineError, ValResult};
-use crate::recursion_guard::RecursionGuard;
+use crate::errors::{py_err_string, ErrorType, ErrorTypeDefaults, InputValue, ValError, ValLineError, ValResult};
 use crate::tools::py_err;
-use crate::validators::{CombinedValidator, Extra, Validator};
+use crate::validators::{CombinedValidator, ValidationState, Validator};
 
+use super::input_string::StringMapping;
 use super::parse_json::{JsonArray, JsonInput, JsonObject};
 use super::{py_error_on_minusone, Input};
 
@@ -105,15 +106,17 @@ struct MaxLengthCheck<'a, INPUT> {
     max_length: Option<usize>,
     field_type: &'a str,
     input: &'a INPUT,
+    actual_length: Option<usize>,
 }
 
 impl<'a, INPUT: Input<'a>> MaxLengthCheck<'a, INPUT> {
-    fn new(max_length: Option<usize>, field_type: &'a str, input: &'a INPUT) -> Self {
+    fn new(max_length: Option<usize>, field_type: &'a str, input: &'a INPUT, actual_length: Option<usize>) -> Self {
         Self {
             current_length: 0,
             max_length,
             field_type,
             input,
+            actual_length,
         }
     }
 
@@ -125,7 +128,8 @@ impl<'a, INPUT: Input<'a>> MaxLengthCheck<'a, INPUT> {
                     ErrorType::TooLong {
                         field_type: self.field_type.to_string(),
                         max_length,
-                        actual_length: self.current_length,
+                        actual_length: self.actual_length,
+                        context: None,
                     },
                     self.input,
                 ));
@@ -140,6 +144,7 @@ macro_rules! any_next_error {
         ValError::new_with_loc(
             ErrorType::IterationError {
                 error: py_err_string($py, $err),
+                context: None,
             },
             $input,
             $index,
@@ -154,15 +159,13 @@ fn validate_iter_to_vec<'a, 's>(
     capacity: usize,
     mut max_length_check: MaxLengthCheck<'a, impl Input<'a>>,
     validator: &'s CombinedValidator,
-    extra: &Extra,
-    definitions: &'a [CombinedValidator],
-    recursion_guard: &'s mut RecursionGuard,
+    state: &mut ValidationState,
 ) -> ValResult<'a, Vec<PyObject>> {
     let mut output: Vec<PyObject> = Vec::with_capacity(capacity);
     let mut errors: Vec<ValLineError> = Vec::new();
     for (index, item_result) in iter.enumerate() {
         let item = item_result.map_err(|e| any_next_error!(py, e, max_length_check.input, index))?;
-        match validator.validate(py, item, extra, definitions, recursion_guard) {
+        match validator.validate(py, item, state) {
             Ok(item) => {
                 max_length_check.incr()?;
                 output.push(item);
@@ -201,12 +204,11 @@ impl BuildSet for &PySet {
 
 impl BuildSet for &PyFrozenSet {
     fn build_add(&self, item: PyObject) -> PyResult<()> {
-        unsafe {
-            py_error_on_minusone(
-                self.py(),
-                ffi::PySet_Add(self.as_ptr(), item.to_object(self.py()).as_ptr()),
-            )
-        }
+        py_error_on_minusone(self.py(), unsafe {
+            // Safety: self.as_ptr() the _only_ pointer to the `frozenset`, and it's allowed
+            // to mutate this via the C API when nothing else can refer to it.
+            ffi::PySet_Add(self.as_ptr(), item.to_object(self.py()).as_ptr())
+        })
     }
 
     fn build_len(&self) -> usize {
@@ -223,24 +225,25 @@ fn validate_iter_to_set<'a, 's>(
     field_type: &'static str,
     max_length: Option<usize>,
     validator: &'s CombinedValidator,
-    extra: &Extra,
-    definitions: &'a [CombinedValidator],
-    recursion_guard: &'s mut RecursionGuard,
+    state: &mut ValidationState,
 ) -> ValResult<'a, ()> {
     let mut errors: Vec<ValLineError> = Vec::new();
     for (index, item_result) in iter.enumerate() {
         let item = item_result.map_err(|e| any_next_error!(py, e, input, index))?;
-        match validator.validate(py, item, extra, definitions, recursion_guard) {
+        match validator.validate(py, item, state) {
             Ok(item) => {
                 set.build_add(item)?;
                 if let Some(max_length) = max_length {
-                    let actual_length = set.build_len();
-                    if actual_length > max_length {
+                    if set.build_len() > max_length {
                         return Err(ValError::new(
                             ErrorType::TooLong {
                                 field_type: field_type.to_string(),
                                 max_length,
-                                actual_length,
+                                // The logic here is that it doesn't matter how many elements the
+                                // input actually had; all we know is it had more than the allowed
+                                // number of deduplicated elements.
+                                actual_length: None,
+                                context: None,
                             },
                             input,
                         ));
@@ -311,27 +314,15 @@ impl<'a> GenericIterable<'a> {
         max_length: Option<usize>,
         field_type: &'static str,
         validator: &'s CombinedValidator,
-        extra: &Extra,
-        definitions: &'a [CombinedValidator],
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'a, Vec<PyObject>> {
-        let capacity = self
-            .generic_len()
-            .unwrap_or_else(|| max_length.unwrap_or(DEFAULT_CAPACITY));
-        let max_length_check = MaxLengthCheck::new(max_length, field_type, input);
+        let actual_length = self.generic_len();
+        let capacity = actual_length.unwrap_or(DEFAULT_CAPACITY);
+        let max_length_check = MaxLengthCheck::new(max_length, field_type, input, actual_length);
 
         macro_rules! validate {
             ($iter:expr) => {
-                validate_iter_to_vec(
-                    py,
-                    $iter,
-                    capacity,
-                    max_length_check,
-                    validator,
-                    extra,
-                    definitions,
-                    recursion_guard,
-                )
+                validate_iter_to_vec(py, $iter, capacity, max_length_check, validator, state)
             };
         }
 
@@ -356,24 +347,11 @@ impl<'a> GenericIterable<'a> {
         max_length: Option<usize>,
         field_type: &'static str,
         validator: &'s CombinedValidator,
-        extra: &Extra,
-        definitions: &'a [CombinedValidator],
-        recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'a, ()> {
         macro_rules! validate_set {
             ($iter:expr) => {
-                validate_iter_to_set(
-                    py,
-                    set,
-                    $iter,
-                    input,
-                    field_type,
-                    max_length,
-                    validator,
-                    extra,
-                    definitions,
-                    recursion_guard,
-                )
+                validate_iter_to_set(py, set, $iter, input, field_type, max_length, validator, state)
             };
         }
 
@@ -396,7 +374,8 @@ impl<'a> GenericIterable<'a> {
         field_type: &'static str,
         max_length: Option<usize>,
     ) -> ValResult<'a, Vec<PyObject>> {
-        let max_length_check = MaxLengthCheck::new(max_length, field_type, input);
+        let actual_length = self.generic_len();
+        let max_length_check = MaxLengthCheck::new(max_length, field_type, input, actual_length);
 
         match self {
             GenericIterable::List(collection) => {
@@ -429,6 +408,7 @@ impl<'a> GenericIterable<'a> {
 pub enum GenericMapping<'a> {
     PyDict(&'a PyDict),
     PyMapping(&'a PyMapping),
+    StringMapping(&'a PyDict),
     PyGetAttr(&'a PyAny, Option<&'a PyDict>),
     JsonObject(&'a JsonObject),
 }
@@ -466,6 +446,7 @@ fn mapping_err<'py>(err: PyErr, py: Python<'py>, input: &'py impl Input<'py>) ->
     ValError::new(
         ErrorType::MappingType {
             error: py_err_string(py, err).into(),
+            context: None,
         },
         input,
     )
@@ -490,55 +471,64 @@ impl<'py> Iterator for MappingGenericIterator<'py> {
     type Item = ValResult<'py, (&'py PyAny, &'py PyAny)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let item = match self.iter.next() {
-            Some(Err(e)) => return Some(Err(mapping_err(e, self.iter.py(), self.input))),
-            Some(Ok(item)) => item,
-            None => return None,
-        };
-        let tuple: &PyTuple = match item.downcast() {
-            Ok(tuple) => tuple,
-            Err(_) => {
-                return Some(Err(ValError::new(
+        Some(match self.iter.next()? {
+            Ok(item) => item.extract().map_err(|_| {
+                ValError::new(
                     ErrorType::MappingType {
                         error: MAPPING_TUPLE_ERROR.into(),
+                        context: None,
                     },
                     self.input,
-                )))
-            }
-        };
-        if tuple.len() != 2 {
-            return Some(Err(ValError::new(
-                ErrorType::MappingType {
-                    error: MAPPING_TUPLE_ERROR.into(),
-                },
-                self.input,
-            )));
-        };
-        #[cfg(PyPy)]
-        let key = tuple.get_item(0).unwrap();
-        #[cfg(PyPy)]
-        let value = tuple.get_item(1).unwrap();
-        #[cfg(not(PyPy))]
-        let key = unsafe { tuple.get_item_unchecked(0) };
-        #[cfg(not(PyPy))]
-        let value = unsafe { tuple.get_item_unchecked(1) };
-        Some(Ok((key, value)))
+                )
+            }),
+            Err(e) => Err(mapping_err(e, self.iter.py(), self.input)),
+        })
     }
-    // size_hint is omitted as it isn't needed
+}
+
+pub struct StringMappingGenericIterator<'py> {
+    dict_iter: PyDictIterator<'py>,
+}
+
+impl<'py> StringMappingGenericIterator<'py> {
+    pub fn new(dict: &'py PyDict) -> ValResult<'py, Self> {
+        Ok(Self { dict_iter: dict.iter() })
+    }
+}
+
+impl<'py> Iterator for StringMappingGenericIterator<'py> {
+    // key (the first member of the tuple could be a simple String)
+    type Item = ValResult<'py, (StringMapping<'py>, StringMapping<'py>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.dict_iter.next() {
+            Some((py_key, py_value)) => {
+                let key = match StringMapping::new_key(py_key) {
+                    Ok(key) => key,
+                    Err(e) => return Some(Err(e)),
+                };
+                let value = match StringMapping::new_value(py_value) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                };
+                Some(Ok((key, value)))
+            }
+            None => None,
+        }
+    }
 }
 
 pub struct AttributesGenericIterator<'py> {
     object: &'py PyAny,
-    attributes: &'py PyList,
-    index: usize,
+    // PyO3 should export this type upstream
+    attributes_iterator: <&'py PyList as IntoIterator>::IntoIter,
 }
 
 impl<'py> AttributesGenericIterator<'py> {
     pub fn new(py_any: &'py PyAny) -> ValResult<'py, Self> {
         Ok(Self {
             object: py_any,
-            attributes: py_any.dir(),
-            index: 0,
+            attributes_iterator: py_any.dir().into_iter(),
         })
     }
 }
@@ -549,37 +539,31 @@ impl<'py> Iterator for AttributesGenericIterator<'py> {
     fn next(&mut self) -> Option<Self::Item> {
         // loop until we find an attribute who's name does not start with underscore,
         // or we get to the end of the list of attributes
-        while self.index < self.attributes.len() {
-            #[cfg(PyPy)]
-            let name: &PyAny = self.attributes.get_item(self.index).unwrap();
-            #[cfg(not(PyPy))]
-            let name: &PyAny = unsafe { self.attributes.get_item_unchecked(self.index) };
-            self.index += 1;
-            // from benchmarks this is 14x faster than using the python `startswith` method
-            let name_cow = match name.downcast::<PyString>() {
-                Ok(name) => name.to_string_lossy(),
-                Err(e) => return Some(Err(e.into())),
-            };
-            if !name_cow.as_ref().starts_with('_') {
-                // getattr is most likely to fail due to an exception in a @property, skip
-                if let Ok(attr) = self.object.getattr(name_cow.as_ref()) {
-                    // we don't want bound methods to be included, is there a better way to check?
-                    // ref https://stackoverflow.com/a/18955425/949890
-                    let is_bound = matches!(attr.hasattr(intern!(attr.py(), "__self__")), Ok(true));
-                    // the PyFunction::is_type_of(attr) catches `staticmethod`, but also any other function,
-                    // I think that's better than including static methods in the yielded attributes,
-                    // if someone really wants fields, they can use an explicit field, or a function to modify input
-                    #[cfg(not(PyPy))]
-                    if !is_bound && !PyFunction::is_type_of(attr) {
-                        return Some(Ok((name, attr)));
-                    }
-                    // MASSIVE HACK! PyFunction doesn't exist for PyPy,
-                    // is_instance_of::<PyFunction> crashes with a null pointer, hence this hack, see
-                    // https://github.com/pydantic/pydantic-core/pull/161#discussion_r917257635
-                    #[cfg(PyPy)]
-                    if !is_bound && attr.get_type().to_string() != "<class 'function'>" {
-                        return Some(Ok((name, attr)));
-                    }
+        let name = self.attributes_iterator.next()?;
+        // from benchmarks this is 14x faster than using the python `startswith` method
+        let name_cow = match name.downcast::<PyString>() {
+            Ok(name) => name.to_string_lossy(),
+            Err(e) => return Some(Err(e.into())),
+        };
+        if !name_cow.as_ref().starts_with('_') {
+            // getattr is most likely to fail due to an exception in a @property, skip
+            if let Ok(attr) = self.object.getattr(name_cow.as_ref()) {
+                // we don't want bound methods to be included, is there a better way to check?
+                // ref https://stackoverflow.com/a/18955425/949890
+                let is_bound = matches!(attr.hasattr(intern!(attr.py(), "__self__")), Ok(true));
+                // the PyFunction::is_type_of(attr) catches `staticmethod`, but also any other function,
+                // I think that's better than including static methods in the yielded attributes,
+                // if someone really wants fields, they can use an explicit field, or a function to modify input
+                #[cfg(not(PyPy))]
+                if !is_bound && !PyFunction::is_type_of(attr) {
+                    return Some(Ok((name, attr)));
+                }
+                // MASSIVE HACK! PyFunction doesn't exist for PyPy,
+                // is_instance_of::<PyFunction> crashes with a null pointer, hence this hack, see
+                // https://github.com/pydantic/pydantic-core/pull/161#discussion_r917257635
+                #[cfg(PyPy)]
+                if !is_bound && attr.get_type().to_string() != "<class 'function'>" {
+                    return Some(Ok((name, attr)));
                 }
             }
         }
@@ -617,12 +601,7 @@ pub enum GenericIterator {
 
 impl From<JsonArray> for GenericIterator {
     fn from(array: JsonArray) -> Self {
-        let length = array.len();
-        let json_iter = GenericJsonIterator {
-            array,
-            length,
-            index: 0,
-        };
+        let json_iter = GenericJsonIterator { array, index: 0 };
         Self::JsonArray(json_iter)
     }
 }
@@ -658,8 +637,8 @@ impl GenericPyIterator {
         }
     }
 
-    pub fn input<'a>(&'a self, py: Python<'a>) -> &'a PyAny {
-        self.obj.as_ref(py)
+    pub fn input_as_error_value<'py>(&self, py: Python<'py>) -> InputValue<'py> {
+        InputValue::PyAny(self.obj.clone_ref(py).into_ref(py))
     }
 
     pub fn index(&self) -> usize {
@@ -670,14 +649,15 @@ impl GenericPyIterator {
 #[derive(Debug, Clone)]
 pub struct GenericJsonIterator {
     array: JsonArray,
-    length: usize,
     index: usize,
 }
 
 impl GenericJsonIterator {
     pub fn next(&mut self, _py: Python) -> PyResult<Option<(&JsonInput, usize)>> {
-        if self.index < self.length {
-            let next = unsafe { self.array.get_unchecked(self.index) };
+        if self.index < self.array.len() {
+            // panic here is impossible due to bounds check above; compiler should be
+            // able to optimize it away even
+            let next = &self.array[self.index];
             let a = (next, self.index);
             self.index += 1;
             Ok(Some(a))
@@ -686,9 +666,8 @@ impl GenericJsonIterator {
         }
     }
 
-    pub fn input<'a>(&'a self, py: Python<'a>) -> &'a PyAny {
-        let input = JsonInput::Array(self.array.clone());
-        input.to_object(py).into_ref(py)
+    pub fn input_as_error_value<'py>(&self, _py: Python<'py>) -> InputValue<'py> {
+        InputValue::JsonInput(JsonInput::Array(self.array.clone()))
     }
 
     pub fn index(&self) -> usize {
@@ -724,6 +703,7 @@ impl<'a> JsonArgs<'a> {
 pub enum GenericArguments<'a> {
     Py(PyArgs<'a>),
     Json(JsonArgs<'a>),
+    StringMapping(&'a PyDict),
 }
 
 impl<'a> From<PyArgs<'a>> for GenericArguments<'a> {
@@ -766,6 +746,12 @@ impl<'a> From<&'a str> for EitherString<'a> {
     }
 }
 
+impl<'a> From<String> for EitherString<'a> {
+    fn from(data: String) -> Self {
+        Self::Cow(Cow::Owned(data))
+    }
+}
+
 impl<'a> From<&'a PyString> for EitherString<'a> {
     fn from(date: &'a PyString) -> Self {
         Self::Py(date)
@@ -781,7 +767,7 @@ impl<'a> IntoPy<PyObject> for EitherString<'a> {
 pub fn py_string_str(py_str: &PyString) -> ValResult<&str> {
     py_str
         .to_str()
-        .map_err(|_| ValError::new_custom_input(ErrorType::StringUnicode, InputValue::PyAny(py_str as &PyAny)))
+        .map_err(|_| ValError::new_custom_input(ErrorTypeDefaults::StringUnicode, InputValue::PyAny(py_str as &PyAny)))
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -842,21 +828,35 @@ pub enum EitherInt<'a> {
 }
 
 impl<'a> EitherInt<'a> {
+    pub fn upcast(py_any: &'a PyAny) -> ValResult<Self> {
+        // Safety: we know that py_any is a python int
+        if let Ok(int_64) = py_any.extract::<i64>() {
+            Ok(Self::I64(int_64))
+        } else {
+            let big_int: BigInt = py_any.extract()?;
+            Ok(Self::BigInt(big_int))
+        }
+    }
     pub fn into_i64(self, py: Python<'a>) -> ValResult<'a, i64> {
         match self {
             EitherInt::I64(i) => Ok(i),
             EitherInt::U64(u) => match i64::try_from(u) {
                 Ok(u) => Ok(u),
-                Err(_) => Err(ValError::new(ErrorType::IntParsingSize, u.into_py(py).into_ref(py))),
+                Err(_) => Err(ValError::new(
+                    ErrorTypeDefaults::IntParsingSize,
+                    u.into_py(py).into_ref(py),
+                )),
             },
             EitherInt::BigInt(u) => match i64::try_from(u) {
                 Ok(u) => Ok(u),
                 Err(e) => Err(ValError::new(
-                    ErrorType::IntParsingSize,
+                    ErrorTypeDefaults::IntParsingSize,
                     e.into_original().into_py(py).into_ref(py),
                 )),
             },
-            EitherInt::Py(i) => i.extract().map_err(|_| ValError::new(ErrorType::IntParsingSize, i)),
+            EitherInt::Py(i) => i
+                .extract()
+                .map_err(|_| ValError::new(ErrorTypeDefaults::IntParsingSize, i)),
         }
     }
 
@@ -868,7 +868,9 @@ impl<'a> EitherInt<'a> {
                 Err(_) => Ok(Int::Big(BigInt::from(*u))),
             },
             EitherInt::BigInt(b) => Ok(Int::Big(b.clone())),
-            EitherInt::Py(i) => i.extract().map_err(|_| ValError::new(ErrorType::IntParsingSize, *i)),
+            EitherInt::Py(i) => i
+                .extract()
+                .map_err(|_| ValError::new(ErrorTypeDefaults::IntParsingSize, *i)),
         }
     }
 
@@ -910,18 +912,17 @@ impl<'a> IntoPy<PyObject> for EitherInt<'a> {
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(Copy, Clone)]
 pub enum EitherFloat<'a> {
     F64(f64),
-    Py(&'a PyAny),
+    Py(&'a PyFloat),
 }
 
-impl<'a> TryInto<f64> for EitherFloat<'a> {
-    type Error = ValError<'a>;
-
-    fn try_into(self) -> ValResult<'a, f64> {
+impl<'a> EitherFloat<'a> {
+    pub fn as_f64(self) -> f64 {
         match self {
-            EitherFloat::F64(f) => Ok(f),
-            EitherFloat::Py(i) => i.extract().map_err(|_| ValError::new(ErrorType::FloatParsing, i)),
+            EitherFloat::F64(f) => f,
+            EitherFloat::Py(f) => f.value(),
         }
     }
 }

@@ -7,10 +7,11 @@ use test::{black_box, Bencher};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
 
-use _pydantic_core::SchemaValidator;
+use _pydantic_core::{validate_core_schema, SchemaValidator};
 
 fn build_schema_validator_with_globals(py: Python, code: &str, globals: Option<&PyDict>) -> SchemaValidator {
-    let schema: &PyDict = py.eval(code, globals, None).unwrap().extract().unwrap();
+    let mut schema: &PyDict = py.eval(code, globals, None).unwrap().extract().unwrap();
+    schema = validate_core_schema(py, schema, None).unwrap().extract().unwrap();
     SchemaValidator::py_new(py, schema, None).unwrap()
 }
 
@@ -444,11 +445,56 @@ fn complete_model(bench: &mut Bencher) {
         sys_path.call_method1("append", ("./tests/benchmarks/",)).unwrap();
 
         let complete_schema = py.import("complete_schema").unwrap();
-        let schema = complete_schema.call_method0("schema").unwrap();
+        let mut schema = complete_schema.call_method0("schema").unwrap();
+        schema = validate_core_schema(py, schema, None).unwrap().extract().unwrap();
         let validator = SchemaValidator::py_new(py, schema, None).unwrap();
 
         let input = complete_schema.call_method0("input_data_lax").unwrap();
         let input = black_box(input);
+
+        bench.iter(|| {
+            black_box(validator.validate_python(py, input, None, None, None, None).unwrap());
+        })
+    })
+}
+
+#[bench]
+fn nested_model_using_definitions(bench: &mut Bencher) {
+    Python::with_gil(|py| {
+        let sys_path = py.import("sys").unwrap().getattr("path").unwrap();
+        sys_path.call_method1("append", ("./tests/benchmarks/",)).unwrap();
+
+        let complete_schema = py.import("nested_schema").unwrap();
+        let mut schema = complete_schema.call_method0("schema_using_defs").unwrap();
+        schema = validate_core_schema(py, schema, None).unwrap().extract().unwrap();
+        let validator = SchemaValidator::py_new(py, schema, None).unwrap();
+
+        let input = complete_schema.call_method0("input_data_valid").unwrap();
+        let input = black_box(input);
+
+        validator.validate_python(py, input, None, None, None, None).unwrap();
+
+        bench.iter(|| {
+            black_box(validator.validate_python(py, input, None, None, None, None).unwrap());
+        })
+    })
+}
+
+#[bench]
+fn nested_model_inlined(bench: &mut Bencher) {
+    Python::with_gil(|py| {
+        let sys_path = py.import("sys").unwrap().getattr("path").unwrap();
+        sys_path.call_method1("append", ("./tests/benchmarks/",)).unwrap();
+
+        let complete_schema = py.import("nested_schema").unwrap();
+        let mut schema = complete_schema.call_method0("inlined_schema").unwrap();
+        schema = validate_core_schema(py, schema, None).unwrap().extract().unwrap();
+        let validator = SchemaValidator::py_new(py, schema, None).unwrap();
+
+        let input = complete_schema.call_method0("input_data_valid").unwrap();
+        let input = black_box(input);
+
+        validator.validate_python(py, input, None, None, None, None).unwrap();
 
         bench.iter(|| {
             black_box(validator.validate_python(py, input, None, None, None, None).unwrap());

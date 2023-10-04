@@ -6,10 +6,9 @@ use crate::build_tools::is_strict;
 use crate::errors::{ErrorType, ValError, ValResult};
 use crate::input::Input;
 
-use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
-use super::{BuildValidator, CombinedValidator, Definitions, DefinitionsBuilder, Extra, Validator};
+use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
 #[derive(Debug, Clone)]
 pub struct BytesValidator {
@@ -41,23 +40,17 @@ impl BuildValidator for BytesValidator {
 impl_py_gc_traverse!(BytesValidator {});
 
 impl Validator for BytesValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        let either_bytes = input.validate_bytes(extra.strict.unwrap_or(self.strict))?;
+        let either_bytes = input.validate_bytes(state.strict_or(self.strict))?;
         Ok(either_bytes.into_py(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         !ultra_strict
     }
 
@@ -65,7 +58,7 @@ impl Validator for BytesValidator {
         Self::EXPECTED_TYPE
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }
@@ -80,36 +73,42 @@ pub struct BytesConstrainedValidator {
 impl_py_gc_traverse!(BytesConstrainedValidator {});
 
 impl Validator for BytesConstrainedValidator {
-    fn validate<'s, 'data>(
-        &'s self,
+    fn validate<'data>(
+        &self,
         py: Python<'data>,
         input: &'data impl Input<'data>,
-        extra: &Extra,
-        _definitions: &'data Definitions<CombinedValidator>,
-        _recursion_guard: &'s mut RecursionGuard,
+        state: &mut ValidationState,
     ) -> ValResult<'data, PyObject> {
-        let either_bytes = input.validate_bytes(extra.strict.unwrap_or(self.strict))?;
+        let either_bytes = input.validate_bytes(state.strict_or(self.strict))?;
         let len = either_bytes.len()?;
 
         if let Some(min_length) = self.min_length {
             if len < min_length {
-                return Err(ValError::new(ErrorType::BytesTooShort { min_length }, input));
+                return Err(ValError::new(
+                    ErrorType::BytesTooShort {
+                        min_length,
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
         if let Some(max_length) = self.max_length {
             if len > max_length {
-                return Err(ValError::new(ErrorType::BytesTooLong { max_length }, input));
+                return Err(ValError::new(
+                    ErrorType::BytesTooLong {
+                        max_length,
+                        context: None,
+                    },
+                    input,
+                ));
             }
         }
 
         Ok(either_bytes.into_py(py))
     }
 
-    fn different_strict_behavior(
-        &self,
-        _definitions: Option<&DefinitionsBuilder<CombinedValidator>>,
-        ultra_strict: bool,
-    ) -> bool {
+    fn different_strict_behavior(&self, ultra_strict: bool) -> bool {
         !ultra_strict
     }
 
@@ -117,7 +116,7 @@ impl Validator for BytesConstrainedValidator {
         "constrained-bytes"
     }
 
-    fn complete(&mut self, _definitions: &DefinitionsBuilder<CombinedValidator>) -> PyResult<()> {
+    fn complete(&self) -> PyResult<()> {
         Ok(())
     }
 }
